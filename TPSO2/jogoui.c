@@ -9,28 +9,46 @@
 
 //#define PIPE_NAME _T("\\\\.\\pipe\\teste")
 
-#define MAXLETRAS 4
+#define MAXLETRAS 3
 #define RITMO 3 * 1000
 
-volatile bool run = true; 
+#define MAX_CONSOLE_EVENTS 128
+#define INPUT_BUFFER_SIZE 64
 
-HANDLE hConsole;                     
+volatile bool run = true;
+
+HANDLE hConsole;
 CONSOLE_CURSOR_INFO originalCursorInfo;
 HANDLE hStdin;        // Handle para o INPUT da consola
 DWORD originalStdInMode; // Para guardar o modo origina
 
-HANDLE hMutex = NULL, hEvent = NULL;
+HANDLE hMutex = NULL;
 
 TCHAR gerarLetra() { return (TCHAR)rand() % 26 + 65; }
+
+// Fncao para limpar linha da consola
+void limparLinha(SHORT y) {
+    COORD coord = { 0, y };
+
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    DWORD charsWritten;
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) return;
+
+    SetConsoleCursorPosition(hConsole, coord);
+    FillConsoleOutputCharacter(hConsole, _T(' '), csbi.dwSize.X, coord, &charsWritten);
+    SetConsoleCursorPosition(hConsole, coord);
+}
+
+void moverCursor(SHORT x, SHORT y) {
+    COORD coord = { x, y };
+    SetConsoleCursorPosition(hConsole, coord);
+}
 
 void imprimirVetor(TCHAR* letras) {
     COORD coord = { 0, 0 }; // Coordenada de início
     CONSOLE_SCREEN_BUFFER_INFO csbi;
-    
-    if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
-        coord.Y = csbi.dwCursorPosition.Y; // Mantém a linha Y atual
-    }
 
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) return;
     SetConsoleCursorPosition(hConsole, coord);
 
     int charsWritten = 0;
@@ -71,51 +89,128 @@ bool escreveVetor(TCHAR* letras) {
 }
 
 bool apagaLetra(TCHAR* letras, int pos) {
-  
-	if (pos < 0 || pos >= MAXLETRAS) return false; 
+
+    if (pos < 0 || pos >= MAXLETRAS) return false;
 
     letras[pos] = _T('\0');
     return true;
 }
 
-DWORD WINAPI threadEscreve(LPVOID lpParam) {
-	TCHAR* letras = (TCHAR*)lpParam;
+DWORD WINAPI threadGeradorLetras(LPVOID lpParam) {
+    TCHAR* letras = (TCHAR*)lpParam;
+	Sleep(1000);
+    while (run)
+    {
+        bool flag = false;
 
-	while (run) {
-        bool event = false;
+        if (WaitForSingleObject(hMutex, INFINITE) == WAIT_OBJECT_0) {
 
-		if (WaitForSingleObject(hMutex, INFINITE) == WAIT_OBJECT_0) {
-			event = escreveVetor(letras);
-			ReleaseMutex(hMutex);
-		}
+            if (verificaVetorVazio(letras))
+                flag = escreveVetor(letras);
+            else if (!verificaVetorVazio(letras))
+                flag = apagaLetra(letras, MAXLETRAS - 1);
 
-		if (event)
-			SetEvent(hEvent); 
-
-		Sleep(RITMO);
-	}
-	return 0;
-}
-
-DWORD WINAPI threadApaga(LPVOID lpParam) {
-	TCHAR* letras = (TCHAR*)lpParam;
-	while (run) {
-		bool event = false;
-
-		if (WaitForSingleObject(hMutex, INFINITE) == WAIT_OBJECT_0) {
-            
-            if (!verificaVetorVazio(letras)) 
-				event = apagaLetra(letras, MAXLETRAS - 1);
+            imprimirVetor(letras);
 
             ReleaseMutex(hMutex);
-		}
-            
-		if (event)
-			SetEvent(hEvent); 
+        }
+        else {
+            _tprintf(_T("\nERRO: Não foi possível obter o mutex.\n"));
+            run = false;
+            break;
+        }
 
-		Sleep(RITMO);
+        Sleep(RITMO);
     }
-	return 0;
+    return 0;
+}
+
+DWORD WINAPI threadEscutarInput(LPVOID lpParam) {
+    INPUT_RECORD inputRecord[MAX_CONSOLE_EVENTS]; // Buffer para eventos de input
+    DWORD numEventsRead;
+    TCHAR userInputBuffer[INPUT_BUFFER_SIZE]; // Buffer para guardar o texto digitado
+    DWORD userInputLen = 0; // Comprimento atual do texto digitado
+
+    const SHORT INPUT_LINE = 2; // Linha para input
+    TCHAR prompt[] = _T("input>"); // Ajustado
+    DWORD promptLen = (DWORD)_tcslen(prompt);
+    DWORD lenWritten;
+
+    // Escrever o prompt inicial
+    COORD promptCoord = { 0, INPUT_LINE };
+    limparLinha(INPUT_LINE);
+    WriteConsoleOutputCharacter(hConsole, prompt, promptLen, promptCoord, &lenWritten);
+    SHORT inputStartX = (SHORT)promptLen; 
+
+    moverCursor(inputStartX, INPUT_LINE); // Posicionar cursor inicial
+
+    while (run) {
+
+        if (!ReadConsoleInput(hStdin, inputRecord, MAX_CONSOLE_EVENTS, &numEventsRead)) {
+            if (run) { _tprintf(_T("Erro ReadConsoleInput (%lu)\n"), GetLastError()); }
+            run = false;
+            continue;
+        }
+
+        // Processar cada evento lido
+        for (DWORD i = 0; i < numEventsRead; ++i) {
+            // Apenas processar eventos de teclado e quando a tecla é pressionada
+            if (inputRecord[i].EventType == KEY_EVENT &&
+                inputRecord[i].Event.KeyEvent.bKeyDown)
+            {
+                TCHAR ch = inputRecord[i].Event.KeyEvent.uChar.UnicodeChar;
+                WORD vkCode = inputRecord[i].Event.KeyEvent.wVirtualKeyCode;
+
+                // ---Lidar com Teclas ---
+                if (vkCode == VK_RETURN) { // Enter Pressionado
+
+                    userInputBuffer[userInputLen] = _T('\0');
+                    if (userInputLen == 1 && (_tcsicmp(userInputBuffer, _T("q")) == 0)) {
+                        _tprintf(_T("\n'q' detectado. Terminando...\n"));
+                        run = false;
+                    }
+
+                    userInputLen = 0;
+                    userInputBuffer[0] = _T('\0');
+                    moverCursor(0, INPUT_LINE);
+                    limparLinha(INPUT_LINE);   
+
+                    WriteConsoleOutputCharacter(hConsole, prompt, promptLen, promptCoord, &lenWritten);
+                    moverCursor(inputStartX, INPUT_LINE);
+
+                }
+                else if (vkCode == VK_BACK) { // Backspace Pressionado
+                    if (userInputLen > 0) {
+                        userInputLen--;
+                        SHORT currentX = inputStartX + (SHORT)userInputLen;
+                        COORD backspaceCoord = { currentX, INPUT_LINE };
+
+                        WriteConsoleOutputCharacter(hConsole, _T(" "), 1, backspaceCoord, &lenWritten);
+
+                        moverCursor(currentX, INPUT_LINE);
+                    }
+                }
+                else if (ch >= _T(' ') && userInputLen < INPUT_BUFFER_SIZE - 1) {
+                    userInputBuffer[userInputLen] = ch;
+                 
+                    SHORT currentX = inputStartX + (SHORT)userInputLen;
+                    COORD charCoord = { currentX, INPUT_LINE };
+                    
+                    WriteConsoleOutputCharacter(hConsole, &ch, 1, charCoord, &lenWritten);
+                    
+                    userInputLen++;
+                    
+                    moverCursor(currentX + 1, INPUT_LINE);
+                }
+            }
+        }
+
+        Sleep(100);
+    }
+
+    limparLinha(INPUT_LINE);
+    SetConsoleCursorInfo(hConsole, &originalCursorInfo);
+    return 0;
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
@@ -123,10 +218,10 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     case CTRL_C_EVENT:
         _tprintf(_T("\nSinal de terminação recebido. A desligar...\n"));
         run = false;
-        if (hConsole != INVALID_HANDLE_VALUE) {
+        if (hStdin != INVALID_HANDLE_VALUE)
+            SetConsoleMode(hStdin, originalStdInMode);
+        if (hConsole != INVALID_HANDLE_VALUE)
             SetConsoleCursorInfo(hConsole, &originalCursorInfo);
-        }
-        if (hEvent != NULL) SetEvent(hEvent);
         Sleep(200);
         return TRUE;
     default:
@@ -162,7 +257,7 @@ int _tmain(int argc, LPTSTR argv[]) {
     }
 
     CONSOLE_CURSOR_INFO cursorInfo = originalCursorInfo;
-    cursorInfo.bVisible = FALSE; // Esconde o cursor
+    cursorInfo.bVisible = FALSE; 
     if (!SetConsoleCursorInfo(hConsole, &cursorInfo))
         _tprintf(_T("AVISO: Não foi possível esconder o cursor.\n"));
 
@@ -173,11 +268,13 @@ int _tmain(int argc, LPTSTR argv[]) {
         SetConsoleCtrlHandler(CtrlHandler, FALSE);
         return 1;
     }
-    originalStdInMode = currentStdInMode; 
-    DWORD newStdInMode = originalStdInMode;
- 
-    newStdInMode &= ~ENABLE_QUICK_EDIT_MODE;
 
+    originalStdInMode = currentStdInMode;
+    DWORD newStdInMode = originalStdInMode;
+
+    newStdInMode &= ~ENABLE_QUICK_EDIT_MODE;
+    newStdInMode &= ~ENABLE_ECHO_INPUT;      // <<< DESLIGAR ECHO
+    newStdInMode &= ~ENABLE_LINE_INPUT;      // <<< DESLIGAR MODO LINHA
     newStdInMode |= ENABLE_EXTENDED_FLAGS;
 
     if (!SetConsoleMode(hStdin, newStdInMode))
@@ -191,55 +288,36 @@ int _tmain(int argc, LPTSTR argv[]) {
         return 3;
     }
 
-    hEvent = CreateEvent(NULL,  // Atributos de segurança padrão
-        FALSE, // Auto-reset event (volta a não sinalizado após um wait ser satisfeito)
-        FALSE, // Estado inicial: não sinalizado
-        NULL); // Sem nome
-    if (hEvent == NULL) {
-        _tprintf(_T("ERRO: Falha ao criar Event.\n"));
-        CloseHandle(hMutex);
-        SetConsoleCursorInfo(hConsole, &originalCursorInfo);
-        SetConsoleCtrlHandler(CtrlHandler, FALSE);
-        return 4;
-    }
-
     srand((unsigned int)time(NULL));
     TCHAR letras[MAXLETRAS] = { 0 };
-	
-    HANDLE hescreve = CreateThread(NULL, 0, threadEscreve, letras, 0, NULL);
-    HANDLE hapaga = CreateThread(NULL, 0, threadApaga, letras, 0, NULL);
 
-    if (hescreve == NULL || hapaga == NULL) {
+    HANDLE hGeradorLetras = CreateThread(NULL, 0, threadGeradorLetras, letras, 0, NULL);
+    HANDLE hEscutarInput = CreateThread(NULL, 0, threadEscutarInput, NULL, 0, NULL);
+
+    if (hGeradorLetras == NULL || hEscutarInput == NULL) {
         _tprintf(_T("ERRO: Falha ao criar uma ou ambas as threads.\n"));
-        if (hescreve) CloseHandle(hescreve);
-        if (hapaga) CloseHandle(hapaga);
+        if (hGeradorLetras) CloseHandle(hGeradorLetras);
+        if (hEscutarInput) CloseHandle(hEscutarInput);
+        CloseHandle(hMutex);
+        SetConsoleMode(hStdin, originalStdInMode);
         SetConsoleCursorInfo(hConsole, &originalCursorInfo);
         SetConsoleCtrlHandler(CtrlHandler, FALSE);
         return 2;
     }
 
-    while (run) {
-        if (!run) break;
-		if (WaitForSingleObject(hEvent, 50) == WAIT_OBJECT_0) {
-			if (WaitForSingleObject(hMutex, INFINITE) == WAIT_OBJECT_0) {
-				imprimirVetor(letras);
-				ReleaseMutex(hMutex);
-			}
-		}
-    }
-
-	WaitForSingleObject(hescreve, INFINITE);
-	WaitForSingleObject(hapaga, INFINITE);
+    HANDLE hThreads[] = { hGeradorLetras, hEscutarInput };
+    WaitForMultipleObjects(2, hThreads, TRUE, INFINITE);
 
     SetConsoleCursorInfo(hConsole, &originalCursorInfo);
-	SetConsoleMode(hStdin, originalStdInMode);
+    SetConsoleMode(hStdin, originalStdInMode);
 
-    CloseHandle(hescreve);
-	CloseHandle(hapaga);
-	CloseHandle(hMutex);
-	CloseHandle(hEvent);
+    for (int i = 0; i < sizeof(hThreads) / sizeof(hThreads[0]); ++i)
+        if (hThreads[i] != NULL) 
+            CloseHandle(hThreads[i]);
 
-	SetConsoleCtrlHandler(CtrlHandler, FALSE); // Desregistar
-    
+    CloseHandle(hMutex);
+
+    SetConsoleCtrlHandler(CtrlHandler, FALSE); // Desregistar
+
     return 0;
 }
