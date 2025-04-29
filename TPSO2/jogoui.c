@@ -7,7 +7,8 @@
 #include <time.h> 
 #include <stdbool.h>
 
-//#define PIPE_NAME _T("\\\\.\\pipe\\teste")
+#define PIPE_NAME _T("\\\\.\\pipe\\pipe")
+#define BUFFER_SIZE 512
 
 #define MAXLETRAS 3
 #define RITMO 3 * 1000
