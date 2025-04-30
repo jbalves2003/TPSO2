@@ -15,7 +15,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="arbitro.c">
+    <ClCompile Include="jogadorUI.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

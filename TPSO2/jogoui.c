@@ -6,26 +6,22 @@
 #include <stdlib.h> 
 #include <time.h> 
 #include <stdbool.h>
+#include "mp.h"
 
 #define PIPE_NAME _T("\\\\.\\pipe\\pipe")
 #define BUFFER_SIZE 512
 
-#define MAXLETRAS 5
-#define RITMO 3 * 1000
-
 #define MAX_CONSOLE_EVENTS 128
 #define INPUT_BUFFER_SIZE 64
 
+#define MAXLETRAS 5
 volatile bool run = true;
 
 HANDLE hConsole;
 CONSOLE_CURSOR_INFO originalCursorInfo;
 HANDLE hStdin;        // Handle para o INPUT da consola
 DWORD originalStdInMode; // Para guardar o modo origina
-
-HANDLE hMutex = NULL;
-
-TCHAR gerarLetra() { return (TCHAR)rand() % 26 + 65; }
+HANDLE hMutex;       // Mutex para sincronização
 
 // Fncao para limpar linha da consola
 void limparLinha(SHORT y) {
@@ -69,61 +65,6 @@ void imprimirVetor(TCHAR* letras) {
         & dwCharsWritten);
 
     fflush(stdout);
-}
-
-bool verificaVetorVazio(TCHAR* letras) {
-    for (int i = 0; i < MAXLETRAS; i++)
-        if (letras[i] == _T('\0'))
-            return true;
-
-    return false;
-}
-
-bool escreveVetor(TCHAR* letras) {
-    for (int i = 0; i < MAXLETRAS; i++) {
-        if (letras[i] == _T('\0')) {
-            letras[i] = gerarLetra();
-            return true;
-        }
-    }
-    return false;
-}
-
-bool apagaLetra(TCHAR* letras, int pos) {
-
-    if (pos < 0 || pos >= MAXLETRAS) return false;
-
-    letras[pos] = _T('\0');
-    return true;
-}
-
-DWORD WINAPI threadGeradorLetras(LPVOID lpParam) {
-    TCHAR* letras = (TCHAR*)lpParam;
-	Sleep(1000);
-    while (run)
-    {
-        bool flag = false;
-
-        if (WaitForSingleObject(hMutex, INFINITE) == WAIT_OBJECT_0) {
-
-            if (verificaVetorVazio(letras))
-                flag = escreveVetor(letras);
-            else if (!verificaVetorVazio(letras))
-                flag = apagaLetra(letras, MAXLETRAS - 1);
-
-            imprimirVetor(letras);
-
-            ReleaseMutex(hMutex);
-        }
-        else {
-            _tprintf(_T("\nERRO: Não foi possível obter o mutex.\n"));
-            run = false;
-            break;
-        }
-
-        Sleep(RITMO);
-    }
-    return 0;
 }
 
 DWORD WINAPI threadEscutarInput(LPVOID lpParam) {
@@ -289,16 +230,11 @@ int _tmain(int argc, LPTSTR argv[]) {
         return 3;
     }
 
-    srand((unsigned int)time(NULL));
-    TCHAR letras[MAXLETRAS] = { 0 };
-
-    HANDLE hGeradorLetras = CreateThread(NULL, 0, threadGeradorLetras, letras, 0, NULL);
     HANDLE hEscutarInput = CreateThread(NULL, 0, threadEscutarInput, NULL, 0, NULL);
 
-    if (hGeradorLetras == NULL || hEscutarInput == NULL) {
-        _tprintf(_T("ERRO: Falha ao criar uma ou ambas as threads.\n"));
-        if (hGeradorLetras) CloseHandle(hGeradorLetras);
-        if (hEscutarInput) CloseHandle(hEscutarInput);
+    if (hEscutarInput == NULL) {
+        _tprintf(_T("ERRO: Falha ao criar uma thread.\n"));
+        CloseHandle(hEscutarInput);
         CloseHandle(hMutex);
         SetConsoleMode(hStdin, originalStdInMode);
         SetConsoleCursorInfo(hConsole, &originalCursorInfo);
@@ -306,16 +242,12 @@ int _tmain(int argc, LPTSTR argv[]) {
         return 2;
     }
 
-    HANDLE hThreads[] = { hGeradorLetras, hEscutarInput };
-    WaitForMultipleObjects(2, hThreads, TRUE, INFINITE);
+	WaitForSingleObject(hEscutarInput, INFINITE);
 
     SetConsoleCursorInfo(hConsole, &originalCursorInfo);
     SetConsoleMode(hStdin, originalStdInMode);
 
-    for (int i = 0; i < sizeof(hThreads) / sizeof(hThreads[0]); ++i)
-        if (hThreads[i] != NULL) 
-            CloseHandle(hThreads[i]);
-
+	CloseHandle(hEscutarInput);
     CloseHandle(hMutex);
 
     SetConsoleCtrlHandler(CtrlHandler, FALSE); // Desregistar
