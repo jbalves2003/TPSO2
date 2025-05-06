@@ -24,6 +24,9 @@ typedef struct {
 
 	HANDLE mapFile;
 
+    // pipe
+    HANDLE hpipe;
+
 	// console
 	HANDLE hStdin;        // Handle para o INPUT da consola
 	DWORD originalStdInMode; // Para guardar o modo original do stdin
@@ -73,6 +76,26 @@ void imprimirVetor(TCHAR* letras, HANDLE hStdout) {
         & dwCharsWritten);
 
     fflush(stdout);
+}
+
+DWORD threadLetrasOutput(LPVOID lpParam) {
+    globais* g = (globais*)lpParam;
+
+    Sleep(200);
+
+    while (run) {
+        if (WaitForSingleObject(g->hEvento, INFINITE) == WAIT_OBJECT_0) {
+            if (WaitForSingleObject(g->hMutex, INFINITE) == WAIT_OBJECT_0) {
+                // limparLinha(0, g->hConsole);
+                TCHAR letrasCopia[MAXLETRAS];
+                memcpy(letrasCopia, g->dados->letras, MAXLETRAS * sizeof(TCHAR));
+                ReleaseMutex(g->hMutex);
+
+                imprimirVetor(letrasCopia, g->hStdout);
+            }
+        }
+    }
+    return 0;
 }
 
 DWORD WINAPI threadEscutarInput(LPVOID lpParam) {
@@ -165,26 +188,6 @@ DWORD WINAPI threadEscutarInput(LPVOID lpParam) {
     return 0;
 }
 
-DWORD threadLetrasOutput(LPVOID lpParam) {
-	globais* g = (globais*)lpParam;
-
-	Sleep(200); 
-
-    while (run) {
-        if (WaitForSingleObject(g->hEvento, INFINITE) == WAIT_OBJECT_0) {
-            if (WaitForSingleObject(g->hMutex, INFINITE) == WAIT_OBJECT_0) {
-               // limparLinha(0, g->hConsole);
-				TCHAR letrasCopia[MAXLETRAS];
-                memcpy(letrasCopia, g->dados->letras, MAXLETRAS * sizeof(TCHAR));
-                ReleaseMutex(g->hMutex);
-
-                imprimirVetor(letrasCopia, g->hStdout);
-            }
-        }
-    }
-	return 0;
-}
-
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     switch (fdwCtrlType) {
     case CTRL_C_EVENT:
@@ -197,6 +200,24 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     default:
         return FALSE;
     }
+}
+
+BOOL createPipe(globais *g) {
+    return g->hpipe = CreateFile(
+        PIPE_NAME,      // nome do pipe (o mesmo do Arbitro)
+        GENERIC_WRITE | GENERIC_READ,  // acesso de ESCRITA e LEIITURA
+        0,              // sem partilha
+        NULL,           // segurança default
+        OPEN_EXISTING,  // SÓ abre se o pipe JÁ EXISTIR (criado pelo Arbitro)
+        0,              // atributos default
+        NULL);          // sem template;
+
+    if (g->hpipe == INVALID_HANDLE_VALUE) {
+        g->hpipe = NULL;
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 void offJogador(globais* g) {

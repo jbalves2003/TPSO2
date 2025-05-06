@@ -9,7 +9,7 @@
 #include <time.h>
 #include "mp.h"
 
-#define PIPE_NAME _T("\\\\.\\pipe\\arbitro")
+#define PIPE_NAME _T("\\\\.\\pipe\\pipe")
 #define BUFFER_SIZE 512
 
 #define RITMO 3 * 1000
@@ -23,6 +23,54 @@ typedef struct {
 
 	HANDLE mapFile;
 } memoria_partilhada;
+
+#define NAME_SIZE 20
+#define MAXJOGADORES 20
+
+typedef struct {
+    int id_jogador;
+    TCHAR nome[NAME_SIZE];
+    int pontos;
+} jogador;
+
+
+typedef enum {
+    sair,
+    jogs,
+    pont
+} comando_jogador;
+
+comando_jogador checkComandoJogador(const char* comando) {
+    if (comando == NULL) return NULL;
+
+    if (strcmp(comando, "sair") == 0) return sair;
+    if (strcmp(comando, "jogs") == 0) return jogs;
+    if (strcmp(comando, "iniciarbot") == 0) return pont;
+    
+    return comando;
+}
+
+typedef enum {
+    listar,
+    excluir,
+    iniciarbot,
+    acelerar,
+    travar,
+    encerrar
+} comando_admin;
+
+comando_admin checkComandoAdmin(const char* comando) {
+    if (comando == NULL) return NULL;
+
+    if (strcmp(comando, "listar") == 0) return listar;
+    if (strcmp(comando, "excluir") == 0) return excluir;
+    if (strcmp(comando, "iniciarbot") == 0) return iniciarbot;
+    if (strcmp(comando, "acelerar") == 0) return acelerar;
+    if (strcmp(comando, "travar") == 0) return travar;
+    if (strcmp(comando, "encerrar") == 0) return encerrar;
+
+    return comando;
+}
 
 
 TCHAR gerarLetra() { return (TCHAR)rand() % 26 + 65; }
@@ -92,7 +140,7 @@ HANDLE CriarPipeServidorDuplex() {
     HANDLE hPipe = CreateNamedPipe(
         PIPE_NAME, PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-        PIPE_UNLIMITED_INSTANCES, BUFFER_SIZE, BUFFER_SIZE, 0, NULL);
+        MAXJOGADORES, BUFFER_SIZE, BUFFER_SIZE, 0, NULL);
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         _tprintf(TEXT("Erro ao criar o pipe servidor duplex: %lu\n"), GetLastError());
