@@ -33,6 +33,11 @@ typedef struct {
     int pontos;
 } jogador;
 
+typedef struct {
+	jogador jogadores[MAXJOGADORES];
+	int num_jogadores;
+} lista_jogadores;
+
 
 typedef enum {
     sair,
@@ -40,14 +45,14 @@ typedef enum {
     pont
 } comando_jogador;
 
-comando_jogador checkComandoJogador(const char* comando) {
-    if (comando == NULL) return NULL;
+comando_jogador checkComandoJogador(const TCHAR* comando) {
+    if (comando == NULL) return -1;
 
-    if (strcmp(comando, "sair") == 0) return sair;
-    if (strcmp(comando, "jogs") == 0) return jogs;
-    if (strcmp(comando, "iniciarbot") == 0) return pont;
+    if (strcmp(comando, "/sair") == 0) return sair;
+    if (strcmp(comando, "/jogs") == 0) return jogs;
+    if (strcmp(comando, "/iniciarbot") == 0) return pont;
     
-    return comando;
+    return -1;
 }
 
 typedef enum {
@@ -59,8 +64,8 @@ typedef enum {
     encerrar
 } comando_admin;
 
-comando_admin checkComandoAdmin(const char* comando) {
-    if (comando == NULL) return NULL;
+comando_admin checkComandoAdmin(const TCHAR* comando) {
+    if (comando == NULL) return -1;
 
     if (strcmp(comando, "listar") == 0) return listar;
     if (strcmp(comando, "excluir") == 0) return excluir;
@@ -69,7 +74,7 @@ comando_admin checkComandoAdmin(const char* comando) {
     if (strcmp(comando, "travar") == 0) return travar;
     if (strcmp(comando, "encerrar") == 0) return encerrar;
 
-    return comando;
+    return -1;
 }
 
 
@@ -137,18 +142,72 @@ DWORD WINAPI threadGeradorLetras(memoria_partilhada* mp) {
 }
 
 HANDLE CriarPipeServidorDuplex() {
-    HANDLE hPipe = CreateNamedPipe(
+    HANDLE hpipe = CreateNamedPipe(
         PIPE_NAME, PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         MAXJOGADORES, BUFFER_SIZE, BUFFER_SIZE, 0, NULL);
 
-    if (hPipe == INVALID_HANDLE_VALUE) {
+    if (hpipe == INVALID_HANDLE_VALUE) {
         _tprintf(TEXT("Erro ao criar o pipe servidor duplex: %lu\n"), GetLastError());
     }
     else {
         _tprintf(TEXT("Pipe servidor '%s' criado. Aguardando clientes...\n"), PIPE_NAME);
         }
-    return hPipe;
+    return hpipe;
+}
+
+BOOL enviarMensagem(HANDLE hpipe, const TCHAR* mensagem) {
+	DWORD bytesEscritos;
+	BOOL resultado = WriteFile(hpipe, mensagem, (DWORD)(_tcslen(mensagem) + 1) * sizeof(TCHAR), &bytesEscritos, NULL);
+	if (!resultado)
+		_tprintf(TEXT("Erro ao enviar mensagem pelo pipe: %lu\n"), GetLastError());
+	return resultado;
+}
+
+DWORD WINAPI receberComandos() {
+	while (run) {
+        HANDLE hpipe = CriarPipeServidorDuplex();
+		if (hpipe == INVALID_HANDLE_VALUE) {
+			_tprintf(TEXT("Erro ao criar o pipe: %lu\n"), GetLastError());
+			if (!run) break;
+            continue;
+		}
+
+		BOOL conexao = ConnectNamedPipe(hpipe, NULL);
+		if (!conexao && GetLastError() != ERROR_PIPE_CONNECTED) {
+			_tprintf(TEXT("Erro ao conectar ao pipe: %lu\n"), GetLastError());
+			CloseHandle(hpipe);
+            if (!run) break;
+            continue;
+		}
+
+
+        TCHAR buffer[BUFFER_SIZE];
+        DWORD bytesLidos;
+		BOOL clientConectado = TRUE;
+
+        while (clientConectado)
+        {
+            if (!run) {
+				clientConectado = FALSE;
+				continue;
+            }
+
+            BOOL leitura = ReadFile(hpipe, buffer, (sizeof(buffer) / sizeof(TCHAR) - 1) * sizeof(TCHAR), &bytesLidos, NULL);
+            if (leitura && bytesLidos > 0) {
+                buffer[bytesLidos / sizeof(TCHAR)] = '\0';
+                _tprintf(TEXT("\nComando recebido: %s"), buffer);
+            }
+            else
+                clientConectado = FALSE;
+        }
+
+		FlushFileBuffers(hpipe);
+		DisconnectNamedPipe(hpipe);
+		CloseHandle(hpipe);
+	}
+
+	return 0;
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
@@ -169,7 +228,7 @@ void offArbitro(memoria_partilhada *mp) {
 	if (mp->dados != NULL) UnmapViewOfFile(mp->dados);
 	if (mp->mapFile != NULL) CloseHandle(mp->mapFile);
 	if (mp->hMutex != NULL) CloseHandle(mp->hMutex);
-	if (mp->hEvento != NULL) CloseHandle(mp->hEvento);
+    if (mp->hEvento != NULL) CloseHandle(mp->hEvento);
     mp->dados = NULL;
     mp->mapFile = NULL;
     mp->hMutex = NULL;
@@ -249,11 +308,23 @@ int _tmain(int argc, LPTSTR argv[]) {
         return erro;
 	}
 
-    HANDLE hGeradorLetras = CreateThread(NULL, 0, threadGeradorLetras, &mp, 0, NULL);
-    if (hGeradorLetras != NULL) {
-        WaitForSingleObject(hGeradorLetras, INFINITE);
-		CloseHandle(hGeradorLetras);
-    }
+	SetConsoleCtrlHandler(CtrlHandler, TRUE);
+
+	HANDLE hThreads[2];
+	hThreads[0] = CreateThread(NULL, 0, threadGeradorLetras, &mp, 0, NULL);
+	hThreads[1] = CreateThread(NULL, 0, receberComandos, NULL, 0, NULL);
+
+	if (hThreads[0] == NULL || hThreads[1] == NULL) {
+		_tprintf(_T("ERRO: Falha ao criar threads (%lu).\n"), GetLastError());
+		if (hThreads[0] != NULL) CloseHandle(hThreads[0]);
+		if (hThreads[1] != NULL) CloseHandle(hThreads[1]);
+		offArbitro(&mp);
+		return 1;
+	}
+
+	WaitForMultipleObjects(2, hThreads, TRUE, INFINITE);
+	CloseHandle(hThreads[0]);
+	CloseHandle(hThreads[1]);
 
 	offArbitro(&mp);
     return 0;

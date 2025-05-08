@@ -98,6 +98,32 @@ DWORD threadLetrasOutput(LPVOID lpParam) {
     return 0;
 }
 
+BOOL createPipe(globais* g) {
+    return g->hpipe = CreateFile(
+        PIPE_NAME,      // nome do pipe (o mesmo do Arbitro)
+        GENERIC_WRITE | GENERIC_READ,  // acesso de ESCRITA e LEIITURA
+        0,              // sem partilha
+        NULL,           // segurança default
+        OPEN_EXISTING,  // SÓ abre se o pipe JÁ EXISTIR (criado pelo Arbitro)
+        0,              // atributos default
+        NULL);          // sem template;
+
+    if (g->hpipe == INVALID_HANDLE_VALUE) {
+        g->hpipe = NULL;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+BOOL enviarComando(HANDLE hpipe, const TCHAR* msg) {
+    DWORD bytesWritten;
+    BOOL result = WriteFile(hpipe, msg, (DWORD)(_tcslen(msg) + 1) * sizeof(TCHAR), &bytesWritten, NULL);
+    if (!result)
+        _tprintf(_T("ERRO: Falha ao enviar mensagem pelo pipe (%lu).\n"), GetLastError());
+    return result;
+}
+
 DWORD WINAPI threadEscutarInput(LPVOID lpParam) {
 	globais* g = (globais*)lpParam;
 
@@ -140,10 +166,17 @@ DWORD WINAPI threadEscutarInput(LPVOID lpParam) {
                 if (vkCode == VK_RETURN) { // Enter Pressionado
 
                     userInputBuffer[userInputLen] = _T('\0');
-                    if (userInputLen == 1 && (_tcsicmp(userInputBuffer, _T("q")) == 0)) {
-                        _tprintf(_T("\n'q' detectado. Terminando...\n"));
+                    if ((_tcsicmp(userInputBuffer, _T("/sair")) == 0)) {
+                        _tprintf(_T("\n'comando de saida local' detectado. Terminando...\n"));
                         run = false;
-                    }
+					}
+					else if (userInputLen > 0) {
+						// Enviar o comando para o pipe
+						if (!enviarComando(g->hpipe, userInputBuffer)) {
+                            _tprintf(_T("Falha ao enviar comando pelo pipe.\n"));
+                            run = false;
+                        }
+					}
 
                     userInputLen = 0;
                     userInputBuffer[0] = _T('\0');
@@ -202,24 +235,6 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     }
 }
 
-BOOL createPipe(globais *g) {
-    return g->hpipe = CreateFile(
-        PIPE_NAME,      // nome do pipe (o mesmo do Arbitro)
-        GENERIC_WRITE | GENERIC_READ,  // acesso de ESCRITA e LEIITURA
-        0,              // sem partilha
-        NULL,           // segurança default
-        OPEN_EXISTING,  // SÓ abre se o pipe JÁ EXISTIR (criado pelo Arbitro)
-        0,              // atributos default
-        NULL);          // sem template;
-
-    if (g->hpipe == INVALID_HANDLE_VALUE) {
-        g->hpipe = NULL;
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
 void offJogador(globais* g) {
 	if (g->dados != NULL) UnmapViewOfFile(g->dados);
 	if (g->mapFile != NULL) CloseHandle(g->mapFile);
@@ -228,6 +243,8 @@ void offJogador(globais* g) {
 	if (g->hStdin != NULL) SetConsoleMode(g->hStdin, g->originalStdInMode);
 	g->originalCursorInfo.bVisible = TRUE;
 	if (g->hStdout != NULL) SetConsoleCursorInfo(g->hStdout, &g->originalCursorInfo);
+	if (g->hpipe != NULL) CloseHandle(g->hpipe);
+	g->hpipe = NULL;
 	g->dados = NULL;
 	g->mapFile = NULL;
 	g->hMutex = NULL;
@@ -306,6 +323,11 @@ int setup(globais* g) {
     if (g->dados == NULL) {
         _tprintf(_T("ERRO: Falha ao mapear o arquivo (%lu).\n"), GetLastError());
 		erro++;
+    }
+
+    if (!createPipe(g)) {
+        _tprintf(_T("ERRO: Falha ao criar pipe (%lu).\n"), GetLastError());
+        erro++;
     }
 
 	return erro;
