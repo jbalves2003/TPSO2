@@ -15,6 +15,7 @@
 #define RITMO 3 * 1000
 
 volatile bool run = TRUE;
+volatile HANDLE g_hPipeServidor = NULL;
 
 typedef struct {
     MP* dados;
@@ -26,6 +27,13 @@ typedef struct {
 
 #define NAME_SIZE 20
 #define MAXJOGADORES 20
+
+typedef struct {
+	HANDLE hPipeCliente;
+    TCHAR nome[NAME_SIZE];
+    int pontos;
+} dados_cliente;
+
 
 typedef struct {
     int id_jogador;
@@ -40,22 +48,23 @@ typedef struct {
 
 
 typedef enum {
+    invalido_jogador = -1,
     sair,
     jogs,
     pont
 } comando_jogador;
 
 comando_jogador checkComandoJogador(const TCHAR* comando) {
-    if (comando == NULL) return -1;
-
-    if (strcmp(comando, "/sair") == 0) return sair;
-    if (strcmp(comando, "/jogs") == 0) return jogs;
-    if (strcmp(comando, "/iniciarbot") == 0) return pont;
+    if (comando == NULL) return invalido_jogador;
     
-    return -1;
+	if (_tcsicmp(comando, _T("/sair")) == 0) return sair;
+    if (_tcsicmp(comando, _T("/jogs")) == 0) return jogs;
+    if (_tcsicmp(comando, _T("/pont")) == 0) return pont;
+	return invalido_jogador;
 }
 
 typedef enum {
+    invalido_admin = -1,
     listar,
     excluir,
     iniciarbot,
@@ -65,16 +74,16 @@ typedef enum {
 } comando_admin;
 
 comando_admin checkComandoAdmin(const TCHAR* comando) {
-    if (comando == NULL) return -1;
+    if (comando == NULL) return invalido_admin;
 
-    if (strcmp(comando, "listar") == 0) return listar;
-    if (strcmp(comando, "excluir") == 0) return excluir;
-    if (strcmp(comando, "iniciarbot") == 0) return iniciarbot;
-    if (strcmp(comando, "acelerar") == 0) return acelerar;
-    if (strcmp(comando, "travar") == 0) return travar;
-    if (strcmp(comando, "encerrar") == 0) return encerrar;
+	if (_tcsicmp(comando, _T("/listar")) == 0) return listar;
+    if (_tcsicmp(comando, _T("/excluir")) == 0) return excluir;
+    if (_tcsicmp(comando, _T("/iniciarbot")) == 0) return iniciarbot;
+    if (_tcsicmp(comando, _T("/acelerar")) == 0) return acelerar;
+    if (_tcsicmp(comando, _T("/travar")) == 0) return travar;
+	if (_tcsicmp(comando, _T("/encerrar")) == 0) return encerrar;
 
-    return -1;
+	return invalido_admin;
 }
 
 
@@ -106,7 +115,9 @@ bool apagaLetra(TCHAR* letras, int pos) {
     return true;
 }
 
-DWORD WINAPI threadGeradorLetras(memoria_partilhada* mp) {
+DWORD WINAPI threadGeradorLetras(LPVOID lpParam) {
+	memoria_partilhada* mp = (memoria_partilhada*)lpParam;
+
     while (run)
     {
         
@@ -142,18 +153,18 @@ DWORD WINAPI threadGeradorLetras(memoria_partilhada* mp) {
 }
 
 HANDLE CriarPipeServidorDuplex() {
-    HANDLE hpipe = CreateNamedPipe(
+    HANDLE hPipe = CreateNamedPipe(
         PIPE_NAME, PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         MAXJOGADORES, BUFFER_SIZE, BUFFER_SIZE, 0, NULL);
 
-    if (hpipe == INVALID_HANDLE_VALUE) {
-        _tprintf(TEXT("Erro ao criar o pipe servidor duplex: %lu\n"), GetLastError());
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        _tprintf(TEXT("\nErro ao criar o pipe servidor duplex: %lu\n"), GetLastError());
     }
     else {
-        _tprintf(TEXT("Pipe servidor '%s' criado. Aguardando clientes...\n"), PIPE_NAME);
+        _tprintf(TEXT("\nPipe servidor '%s' criado. Aguardando clientes...\n"), PIPE_NAME);
         }
-    return hpipe;
+    return hPipe;
 }
 
 BOOL enviarMensagem(HANDLE hpipe, const TCHAR* mensagem) {
@@ -164,50 +175,134 @@ BOOL enviarMensagem(HANDLE hpipe, const TCHAR* mensagem) {
 	return resultado;
 }
 
-DWORD WINAPI receberComandos() {
-	while (run) {
-        HANDLE hpipe = CriarPipeServidorDuplex();
-		if (hpipe == INVALID_HANDLE_VALUE) {
-			_tprintf(TEXT("Erro ao criar o pipe: %lu\n"), GetLastError());
-			if (!run) break;
-            continue;
-		}
+DWORD WINAPI receberComandos(LPVOID lpParam) {
 
-		BOOL conexao = ConnectNamedPipe(hpipe, NULL);
-		if (!conexao && GetLastError() != ERROR_PIPE_CONNECTED) {
-			_tprintf(TEXT("Erro ao conectar ao pipe: %lu\n"), GetLastError());
-			CloseHandle(hpipe);
-            if (!run) break;
-            continue;
-		}
+	dados_cliente* cliente = (dados_cliente*)lpParam;
+	if (cliente == NULL) return 1;
 
+    HANDLE hPipeCliente = cliente->hPipeCliente;
+    BOOL clienteConectado = TRUE;
+    TCHAR buffer[BUFFER_SIZE];
 
-        TCHAR buffer[BUFFER_SIZE];
-        DWORD bytesLidos;
-		BOOL clientConectado = TRUE;
+    COMMTIMEOUTS timeouts = { 0 };
+    timeouts.ReadIntervalTimeout = MAXDWORD;
+    timeouts.ReadTotalTimeoutMultiplier = 0;
+    timeouts.ReadTotalTimeoutConstant = 3000;
+    /*
+    if (!SetCommTimeouts(hPipeCliente, &timeouts)) {
+        _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): AVISO - Falha ao definir timeouts: %lu.\n"),
+            GetCurrentThreadId(), hPipeCliente, GetLastError());
+		clienteConectado = FALSE;
+    } else {
+        _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Timeouts de leitura definidos para %dms.\n"),
+            GetCurrentThreadId(), hPipeCliente, timeouts.ReadTotalTimeoutConstant);
+    }*/
 
-        while (clientConectado)
-        {
-            if (!run) {
-				clientConectado = FALSE;
-				continue;
+	while (run && clienteConectado) {
+		if (!run) { clienteConectado = FALSE; continue; }
+
+           
+            DWORD bytesLidos = 0;
+            BOOL resultado = ReadFile(hPipeCliente, buffer, (sizeof(buffer) / sizeof(TCHAR) - 1) * sizeof(TCHAR), &bytesLidos, NULL);
+
+            if (!run) { clienteConectado = FALSE; continue; }
+            
+            if (resultado && bytesLidos > 0) {
+                buffer[bytesLidos / sizeof(TCHAR)] = _T('\0');
+                _tprintf(TEXT("\nARBITRO (Thread %lu, Pipe %p): Comando recebido: '%s'\n"),
+                    GetCurrentThreadId(), hPipeCliente, buffer);
+
+                comando_jogador cmdJogador = checkComandoJogador(buffer);
+                if (cmdJogador == sair) {
+                    _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Jogador '%s' saiu.\n"),
+                        GetCurrentThreadId(), hPipeCliente, cliente->nome);
+                    clienteConectado = FALSE;
+                } else if (cmdJogador == jogs) {
+                    _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Listando jogadores...\n"),
+						GetCurrentThreadId(), hPipeCliente);
+                } else if (cmdJogador == pont) {
+                    _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Iniciando bot...\n"),
+                        GetCurrentThreadId(), hPipeCliente);
+                } else if (cmdJogador == -1) {
+                    _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Comando desconhecido: '%s'\n"),
+                        GetCurrentThreadId(), hPipeCliente, buffer);
+                } else {
+                    _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Comando inválido: '%s'\n"),
+						GetCurrentThreadId(), hPipeCliente, buffer);
+                }
+            } 
+            else if (!resultado && 
+                (GetLastError() != ERROR_BROKEN_PIPE || 
+                 GetLastError() != ERROR_OPERATION_ABORTED || 
+                 GetLastError() != ERROR_INVALID_HANDLE)) {
+                _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Erro ao ler do pipe: %lu\n"),
+                    GetCurrentThreadId(), hPipeCliente, GetLastError());
+                clienteConectado = FALSE;
             }
 
-            BOOL leitura = ReadFile(hpipe, buffer, (sizeof(buffer) / sizeof(TCHAR) - 1) * sizeof(TCHAR), &bytesLidos, NULL);
-            if (leitura && bytesLidos > 0) {
-                buffer[bytesLidos / sizeof(TCHAR)] = '\0';
-                _tprintf(TEXT("\nComando recebido: %s"), buffer);
-            }
-            else
-                clientConectado = FALSE;
-        }
-
-		FlushFileBuffers(hpipe);
-		DisconnectNamedPipe(hpipe);
-		CloseHandle(hpipe);
 	}
 
+    if (hPipeCliente != NULL && hPipeCliente != INVALID_HANDLE_VALUE) {
+        _tprintf(TEXT("ARBITRO (Thread %lu, Pipe %p): Desconectando cliente '%s'.\n"),
+        GetCurrentThreadId(), hPipeCliente, cliente->nome);
+		FlushFileBuffers(hPipeCliente);
+        DisconnectNamedPipe(hPipeCliente);
+        CloseHandle(hPipeCliente);
+	}
+
+	free(cliente);
 	return 0;
+}
+
+DWORD WINAPI threadGereCliente(LPVOID lpParam) {
+    memoria_partilhada* mp = (memoria_partilhada*)lpParam;
+    
+    while (run) {
+		HANDLE hPipe = INVALID_HANDLE_VALUE;
+		InterlockedExchangePointer((PVOID*) &g_hPipeServidor, NULL);
+
+		if (!run) break;
+
+		hPipe = CriarPipeServidorDuplex();
+        if (hPipe == INVALID_HANDLE_VALUE) continue;
+
+		InterlockedExchangePointer((PVOID*)&g_hPipeServidor, hPipe);
+
+        BOOL conexao = ConnectNamedPipe(hPipe, NULL);
+		if (!run) break;
+
+		InterlockedExchangePointer((PVOID*)&g_hPipeServidor, NULL);
+
+        if (!conexao && GetLastError() != ERROR_PIPE_CONNECTED) {
+            _tprintf(TEXT("\nErro ao conectar ao pipe: %lu\n"), GetLastError());
+            CloseHandle(hPipe);
+            continue;
+        }
+
+		dados_cliente* cliente = (dados_cliente*)malloc(sizeof(dados_cliente));
+        if (cliente == NULL) {
+            _tprintf(TEXT("\nERRO: Falha ao alocar memória para dados do cliente.\n"));
+			DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+            continue;
+        }
+        ZeroMemory(cliente, sizeof(dados_cliente));
+		cliente->hPipeCliente = hPipe;
+
+		HANDLE  hThreadCliente = CreateThread(NULL, 0, receberComandos, cliente, 0, NULL);
+
+        if (hThreadCliente == NULL) {
+            _tprintf(TEXT("\nERRO: Falha ao criar thread para cliente (%lu).\n"), GetLastError());
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+            free(cliente);
+        } else
+        	CloseHandle(hThreadCliente);
+    }
+
+	InterlockedExchangePointer((PVOID*)&g_hPipeServidor, NULL);
+	return 0;
+
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
@@ -218,6 +313,10 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
         if (run) _tprintf(_T("\nSinal de terminação recebido. A desligar...\n"));
         run = false; 
         Sleep(200); // Pausa para a thread ver a flag
+		HANDLE hPipe = InterlockedExchangePointer((LPVOID*) &g_hPipeServidor, NULL);
+        if (hPipe != NULL && hPipe != INVALID_HANDLE_VALUE)
+            CloseHandle(hPipe);
+		
         return TRUE;
     default:
         return FALSE;
@@ -302,7 +401,7 @@ int _tmain(int argc, LPTSTR argv[]) {
     srand((unsigned int)time(NULL));
     memoria_partilhada mp = { 0 };
 	
-	byte erro = setup(&mp);
+	int erro = setup(&mp);
 	if (erro != 0) {
 		offArbitro(&mp);
         return erro;
@@ -312,7 +411,7 @@ int _tmain(int argc, LPTSTR argv[]) {
 
 	HANDLE hThreads[2];
 	hThreads[0] = CreateThread(NULL, 0, threadGeradorLetras, &mp, 0, NULL);
-	hThreads[1] = CreateThread(NULL, 0, receberComandos, NULL, 0, NULL);
+	hThreads[1] = CreateThread(NULL, 0, threadGereCliente, &mp, 0, NULL);
 
 	if (hThreads[0] == NULL || hThreads[1] == NULL) {
 		_tprintf(_T("ERRO: Falha ao criar threads (%lu).\n"), GetLastError());
