@@ -9,7 +9,7 @@
 #include <time.h>
 #include "mp.h"
 
-#define DEBUG_MODE 
+//#define DEBUG_MODE 
 
 #ifdef DEBUG_MODE
 #define LOG_DEBUG(format, ...) _tprintf(_T("[DEBUG] :%d: " format _T("\n")), __LINE__, ##__VA_ARGS__)
@@ -26,16 +26,20 @@ int g_NumeroDePalavrasNoDicionario = 0;
 #define PIPE_NAME _T("\\\\.\\pipe\\pipe")
 #define BUFFER_SIZE 512
 
-#define RITMO 3 * 1000
+/////////////////////////////////registry importante ////////////////////////////////////
+#define TEMPO 1000 
+int ritmo = 5 * TEMPO; 
+
 #define PONTUACAO_GANHA 2 // Pontuação por palavra correta
 #define PONTUACAO_PERDIDA 1 // Pontuação perdida por palavra errada
 #define MIN_LETRAS_PARA_PONTUAR 2 // Mínimo de letras usadas para pontuar
 
 #define NAME_SIZE 20
-#define MAXJOGADORES 20
+#define MAXJOGADORES 2
 #define NOME_MUTEX_JOGADORES NULL // Mutex para proteger acesso à lista de jogadores
 
 #define COMANDO_DESLIGAR_CLIENTE _T("/sair")
+#define PROMPT_INPUT _T("Arbitro> ")
 
 
 volatile bool run = TRUE;
@@ -50,6 +54,7 @@ typedef struct {
 } memoria_partilhada;
 
 typedef struct {
+	HANDLE hPipeCliente;
     int id_jogador;
     TCHAR nome[NAME_SIZE];
     int pontos;
@@ -63,8 +68,11 @@ typedef struct {
 } lista_jogadores;
 
 typedef struct {
-	memoria_partilhada* mp;
+    memoria_partilhada* mp;
     lista_jogadores* listaJogadores;
+    HANDLE hConsoleOutputMutex;
+    TCHAR adminInputLine[BUFFER_SIZE]; 
+    int adminInputCursorPos;
 } globais;
 
 typedef struct {
@@ -118,6 +126,35 @@ comando_admin checkComandoAdmin(const TCHAR* comando) {
     return invalido_admin;
 }
 
+void escreverOutput(globais* g, const TCHAR* format, ...) {
+    if (g == NULL || g->hConsoleOutputMutex == NULL) {
+        va_list args_fallback;
+        va_start(args_fallback, format);
+        _vtprintf(format, args_fallback);
+        va_end(args_fallback);
+        _tprintf(_T("\n"));
+        fflush(stdout);
+        return;
+    }
+
+    TCHAR message_buffer[2048]; // Buffer para a mensagem a ser impressa
+    va_list args;
+    va_start(args, format);
+    StringCchVPrintf(message_buffer, _countof(message_buffer), format, args);
+    va_end(args);
+
+    if (WaitForSingleObject(g->hConsoleOutputMutex, INFINITE) == WAIT_OBJECT_0) {
+        _tprintf(_T("\r%*s\r"), 80, _T(""));
+
+        _tprintf(_T("%s\n"), message_buffer);
+
+        _tprintf(_T("Arbitro> %s"), g->adminInputLine); // Se adminInputLine está vazio, só imprime "Arbitro> "
+
+        fflush(stdout);
+        ReleaseMutex(g->hConsoleOutputMutex);
+    }
+}
+
 BOOL carregarDicionario() {
     FILE* fp = NULL;
     errno_t err = _tfopen_s(&fp, MOME_FICHEIRO_DICIONARIO, _T("r, ccs=UTF-8"));
@@ -128,7 +165,7 @@ BOOL carregarDicionario() {
         return FALSE;
     }
 
-    _tprintf(TEXT("ARBITRO: Carregando dicionario de '%s'...\n"), MOME_FICHEIRO_DICIONARIO);
+	LOG_DEBUG(_T("carregarDicionario: Ficheiro '%s' aberto com sucesso."), MOME_FICHEIRO_DICIONARIO);
     g_NumeroDePalavrasNoDicionario = 0;
     TCHAR linhaBuffer[TAMAMANHO_MAX_PALAVRA + 2];
 
@@ -144,11 +181,11 @@ BOOL carregarDicionario() {
     }
 
     fclose(fp);
-    _tprintf(TEXT("ARBITRO: Dicionario carregado com %d palavras.\n"), g_NumeroDePalavrasNoDicionario);
-
+	LOG_DEBUG(_T("carregarDicionario: Carregadas %d palavras do dicionario."), g_NumeroDePalavrasNoDicionario);
+    
     if (g_NumeroDePalavrasNoDicionario == 0) {
-        _tprintf(TEXT("ARBITRO AVISO: Nenhuma palavra carregada do dicionario. O ficheiro pode estar vazio ou mal formatado.\n"));
-        // Decidir se isto é um erro 
+		_tprintf(TEXT("ARBITRO ERRO: O dicionário está vazio ou não contém palavras válidas.\n"));
+		return FALSE;
     }
     return TRUE;
 }
@@ -261,39 +298,69 @@ bool apagaLetra(TCHAR* letras, int pos) {
 }
 
 DWORD WINAPI threadGeradorLetras(LPVOID lpParam) {
-	memoria_partilhada* mp = (memoria_partilhada*)lpParam;
+    globais* g = (globais*)lpParam;
+    if (g == NULL || g->mp == NULL || g->mp->dados == NULL || g->mp->hMutex == NULL) {
+        LOG_DEBUG(_T("threadGeradorLetras: Parâmetros inválidos (g, mp, mp->dados ou mp->hMutex é NULL). Terminando."));
+        return 1;
+    }
+    memoria_partilhada* mp_local = g->mp;
 
-	LOG_DEBUG(_T("Thread Gerador de Letras iniciada."));
+    LOG_DEBUG(_T("Thread Gerador de Letras iniciada."));
 
-    while (run)
-    {
-        if (WaitForSingleObject(mp->hMutex, INFINITE) == WAIT_OBJECT_0) {
+    TCHAR geradorDisplayBuffer[MAXLETRAS * 3 + 30];
 
-            if (verificaVetorVazio(mp->dados->letras))
-                escreveVetor(mp->dados->letras);
-            else if (!verificaVetorVazio(mp->dados->letras))
-                apagaLetra(mp->dados->letras, MAXLETRAS - 1);
+    while (run) {
+        if (WaitForSingleObject(mp_local->hMutex, INFINITE) == WAIT_OBJECT_0) {
+            if (verificaVetorVazio(mp_local->dados->letras)) {
+                escreveVetor(mp_local->dados->letras);
+            }
+            else if (!verificaVetorVazio(mp_local->dados->letras)) { 
+                for (int i = MAXLETRAS - 1; i >= 0; i--) {
+                    if (mp_local->dados->letras[i] != _T('\0')) {
+                        apagaLetra(mp_local->dados->letras, i);
+                        break;
+                    }
+                }
+            }
 
-			_tprintf(_T("\nGerador: "));
-			for (int i = 0; i < MAXLETRAS; i++) {
-				if (mp->dados->letras[i] != _T('\0'))
-					_tprintf(_T("%c "), mp->dados->letras[i]);
-				else
-					_tprintf(_T("_ "));
-			}
-			fflush(stdout);
+            // Construir a string de display para escreverOutput
+            StringCchCopy(geradorDisplayBuffer, _countof(geradorDisplayBuffer), _T("Gerador: "));
+            for (int i = 0; i < MAXLETRAS; i++) {
+                TCHAR letraStr[3]; // Para "X " ou "_ "
+                if (mp_local->dados->letras[i] != _T('\0')) {
+                    StringCchPrintf(letraStr, _countof(letraStr), _T("%c "), mp_local->dados->letras[i]);
+                }
+                else {
+                    StringCchCopy(letraStr, _countof(letraStr), _T("_ "));
+                }
+                StringCchCat(geradorDisplayBuffer, _countof(geradorDisplayBuffer), letraStr);
+            }
 
-            ReleaseMutex(mp->hMutex);
+            // Remover o último espaço se houver
+            size_t len = _tcslen(geradorDisplayBuffer);
+            if (len > 0 && geradorDisplayBuffer[len - 1] == _T(' '))
+                geradorDisplayBuffer[len - 1] = _T('\0');
 
-			SetEvent(mp->hEvento);
+            ReleaseMutex(mp_local->hMutex);
+
+            escreverOutput(g, _T("%s"), geradorDisplayBuffer);
+            if (mp_local->hEvento != NULL) SetEvent(mp_local->hEvento);
         }
         else {
-			LOG_DEBUG(_T("threadGeradorLetras: ERRO ao aceder mutex.\n"));
+            LOG_DEBUG(_T("threadGeradorLetras: ERRO ao aceder ao mutex da memória partilhada."));
             run = false;
             break;
         }
-        Sleep(RITMO);
-	} // fidel do while
+
+        DWORD startTime = GetTickCount();
+        while (GetTickCount() - startTime < ritmo) {
+            if (!run) break;
+            Sleep(100);
+        }
+        if (!run) break;
+    }
+
+    LOG_DEBUG(_T("Thread Gerador de Letras terminando."));
     return 0;
 }
 
@@ -436,6 +503,7 @@ DWORD WINAPI receberComandos(LPVOID lpParam) {
 						enviarMensagemPipe(hPipeCliente, COMANDO_DESLIGAR_CLIENTE);
 						removerJogador(aux->g->listaJogadores, aux->id_jogador);
                         clienteConectado = FALSE;
+                        escreverOutput(aux->g, _T("Cliente '%s' (ID: %d) desconectado. Total de jogadores: %d."),aux->nome, aux->id_jogador, aux->g->listaJogadores->num_jogadores);
                         break;
                     case jogs:
                         LOG_DEBUG(_T("receberComandos: Cliente '%s' solicitou lista de jogadores."), aux->nome);
@@ -457,7 +525,7 @@ DWORD WINAPI receberComandos(LPVOID lpParam) {
                         if (palavra_foi_valida) {
                             _stprintf_s(msg, _countof(msg),_T("/ok Palavra '%s' correta! +%d pontos."),buffer, pontos_ganhos);
                             enviarMensagemPipe(hPipeCliente, msg);
-                            LOG_DEBUG(_T("receberComandos: Palavra VÁLIDA '%s' p/ %s processada. Pontos ganhos: %d. Total atual: %d"),buffer, aux->nome, pontos_ganhos, aux->pontos);
+							escreverOutput(aux->g, _T("Palavra '%s' correta para %s! +%d pts. Total atual: %d"), buffer, aux->nome, pontos_ganhos, aux->pontos);
                         }
                         else {aux->pontos -= PONTUACAO_PERDIDA;
                             if (aux->pontos < 0) aux->pontos = 0;
@@ -547,35 +615,43 @@ DWORD WINAPI threadGereCliente(LPVOID lpParam) {
         aux->hPipeCliente = hPipe;
 		aux->g = g;
 
-		WaitForSingleObject(g->listaJogadores->g_hMutexJogadores, INFINITE);
+        if (WaitForSingleObject(g->listaJogadores->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
+            if (g->listaJogadores->num_jogadores < MAXJOGADORES) {
+                aux->id_jogador = g->listaJogadores->prox_id_jogador;
+                _stprintf_s(aux->nome, _countof(aux->nome), _T("Jogador%d"), aux->id_jogador);
+                aux->pontos = 0;
 
-        if (g->listaJogadores->num_jogadores < MAXJOGADORES) {
-           
-			//criar novo jogador
-			aux->id_jogador = g->listaJogadores->prox_id_jogador;
-			_stprintf_s(aux->nome, _countof(aux->nome), _T("Jogador%d"), aux->id_jogador);
-			aux->pontos = 0;
+                // Preencher a struct jogador na lista global
+                g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].id_jogador = aux->id_jogador;
+                _tcscpy_s(g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].nome, NAME_SIZE, aux->nome);
+                g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].pontos = aux->pontos;
+                g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].hPipeCliente = hPipe;
 
-			//preencher o jogador na lista
-			g->listaJogadores->jogadores[g->listaJogadores->num_jogadores] = (jogador){
-				.id_jogador = aux->id_jogador,
-				.nome = {0},
-				.pontos = aux->pontos
-			};
-			_tcscpy_s(g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].nome, NAME_SIZE, aux->nome);
-			g->listaJogadores->num_jogadores++;
-            g->listaJogadores->prox_id_jogador++;
+                g->listaJogadores->num_jogadores++;
+                g->listaJogadores->prox_id_jogador++;
 
-            _tprintf(TEXT("\nARBITRO: Novo cliente conectado: %s (ID: %d, Pipe: %p)\n"), aux->nome, aux->id_jogador, hPipe);
-        } else {
-			enviarMensagemPipe(hPipe, COMANDO_DESLIGAR_CLIENTE);
+                ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
+                escreverOutput(g, _T("Novo cliente conectado: %s (ID: %d, Pipe: %p). Total: %d"), aux->nome, aux->id_jogador, hPipe, g->listaJogadores->num_jogadores);
+            }
+            else {
+                ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
+                escreverOutput(g, _T("Tentativa de conexão rejeitada: servidor cheio. Pipe: %p"), hPipe);
+                enviarMensagemPipe(hPipe, COMANDO_DESLIGAR_CLIENTE);
+                DisconnectNamedPipe(hPipe);
+                CloseHandle(hPipe);
+                free(aux);
+                continue;
+            }
+        }
+        else {
+            LOG_DEBUG(_T("threadGereCliente: Falha ao obter mutex da lista de jogadores. Desconectando cliente no pipe %p."), hPipe);
+            escreverOutput(g, _T("Erro interno ao tentar adicionar novo jogador. Conexão no pipe %p será fechada."), hPipe);
+            enviarMensagemPipe(hPipe, COMANDO_DESLIGAR_CLIENTE);
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
             free(aux);
-            ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
             continue;
         }
-		ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
 
 		HANDLE  hThreadCliente = CreateThread(NULL, 0, receberComandos, aux, 0, NULL);
 
@@ -613,11 +689,200 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     }
 }
 
+DWORD WINAPI threadAdminConsole(LPVOID lpParam) {
+    globais* g = (globais*)lpParam;
+    if (g == NULL || g->hConsoleOutputMutex == NULL) {
+        LOG_DEBUG(_T("threadAdminConsole: globais ou hConsoleOutputMutex é NULL. Terminando thread."));
+        return 1;
+    }
+
+    TCHAR cmdInputBuffer[BUFFER_SIZE];
+    TCHAR prompt[] = PROMPT_INPUT;
+    TCHAR* pContext = NULL;
+
+    escreverOutput(g, _T("Console do Administrador iniciado. Digite '/encerrar' para desligar."));
+
+    if (WaitForSingleObject(g->hConsoleOutputMutex, INFINITE) == WAIT_OBJECT_0) {
+        _tprintf(prompt);
+        fflush(stdout);
+        ZeroMemory(g->adminInputLine, sizeof(g->adminInputLine));
+        ReleaseMutex(g->hConsoleOutputMutex);
+    }
+    else {
+        LOG_DEBUG(_T("threadAdminConsole: Falha crítica ao obter hConsoleOutputMutex para o prompt inicial."));
+        _tprintf(prompt);
+        fflush(stdout);
+    }
+
+
+    while (run) {
+        if (_fgetts(cmdInputBuffer, _countof(cmdInputBuffer), stdin) == NULL) {
+            if (run) {
+                LOG_DEBUG(_T("threadAdminConsole: _fgetts retornou NULL."));
+            }
+            break;
+        }
+
+        cmdInputBuffer[_tcscspn(cmdInputBuffer, _T("\r\n"))] = _T('\0');
+
+        if (!run) break;
+        if (_tcslen(cmdInputBuffer) == 0) { // Enter vazio
+            if (WaitForSingleObject(g->hConsoleOutputMutex, INFINITE) == WAIT_OBJECT_0) {
+                _tprintf(_T("\r%*s\r"), 80, _T(""));
+                _tprintf(prompt);
+                fflush(stdout);
+                ZeroMemory(g->adminInputLine, sizeof(g->adminInputLine));
+                ReleaseMutex(g->hConsoleOutputMutex);
+            }
+            continue;
+        }
+
+        LOG_DEBUG(_T("threadAdminConsole: Comando digitado: '%s'"), cmdInputBuffer);
+
+        TCHAR* tokenComando = _tcstok_s(cmdInputBuffer, _T(" "), &pContext);
+        TCHAR* argumentoCmd = _tcstok_s(NULL, _T(" \t\n\r"), &pContext);
+
+        if (tokenComando == NULL) {
+            if (WaitForSingleObject(g->hConsoleOutputMutex, INFINITE) == WAIT_OBJECT_0) {
+                _tprintf(_T("\r%*s\r"), 80, _T(""));
+                _tprintf(prompt);
+                fflush(stdout);
+                ZeroMemory(g->adminInputLine, sizeof(g->adminInputLine));
+                ReleaseMutex(g->hConsoleOutputMutex);
+            }
+            continue;
+        }
+
+        comando_admin cmdAdmin = checkComandoAdmin(tokenComando);
+        TCHAR output_buffer[BUFFER_SIZE * 2];
+
+        switch (cmdAdmin) {
+        case listar: {
+            TCHAR* listaJogStr = listarJogadores(g->listaJogadores);
+            if (listaJogStr) {
+                StringCchPrintf(output_buffer, _countof(output_buffer), _T("--- Lista de Jogadores (Admin) ---\n%s"), listaJogStr);
+                escreverOutput(g, _T("%s"), output_buffer); 
+                free(listaJogStr);
+            }
+            else
+                escreverOutput(g, _T("Erro ao obter lista de jogadores."));
+            break;
+        }
+		case acelerar: {
+            if (ritmo > TEMPO) { 
+                ritmo -= TEMPO; 
+                StringCchPrintf(output_buffer, _countof(output_buffer), _T("Ritmo ACELERADO. Novo intervalo: %.2f segundos."), (double)ritmo / TEMPO);
+            }
+            else
+                StringCchPrintf(output_buffer, _countof(output_buffer), _T("Ritmo já está no mínimo (%.2f segundos). Não é possível acelerar mais."), (double)ritmo / TEMPO);
+
+            escreverOutput(g, _T("%s"), output_buffer);
+            break;
+		}
+		case travar: {
+            ritmo += TEMPO;
+            StringCchPrintf(output_buffer, _countof(output_buffer), _T("Ritmo TRAVADO. Novo intervalo: %.2f segundos."), (double)ritmo / TEMPO);
+            escreverOutput(g, _T("%s"), output_buffer);
+            break;
+		}
+        case excluir: {
+            HANDLE hPipeDoJogadorParaFechar = INVALID_HANDLE_VALUE;
+            int jogador_idx = -1;
+            TCHAR nome_jogador_removido[NAME_SIZE] = { 0 };
+
+            if (argumentoCmd != NULL) {
+                int id_para_remover = _tstoi(argumentoCmd);
+                if (id_para_remover > 0) {
+                    if (WaitForSingleObject(g->listaJogadores->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
+                        for (int i = 0; i < g->listaJogadores->num_jogadores; i++) {
+                            if (g->listaJogadores->jogadores[i].id_jogador == id_para_remover) {
+                                hPipeDoJogadorParaFechar = g->listaJogadores->jogadores[i].hPipeCliente;
+                                StringCchCopy(nome_jogador_removido, NAME_SIZE, g->listaJogadores->jogadores[i].nome);
+                                jogador_idx = i;
+                                break;
+                            }
+                        }
+                        ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
+
+                        if (hPipeDoJogadorParaFechar != INVALID_HANDLE_VALUE && hPipeDoJogadorParaFechar != NULL) {
+                            escreverOutput(g, _T("A desconectar jogador %s (ID: %d)..."), nome_jogador_removido, id_para_remover);
+
+                            enviarMensagemPipe(hPipeDoJogadorParaFechar, COMANDO_DESLIGAR_CLIENTE);
+
+                            LOG_DEBUG(_T("Admin excluindo: Fechando pipe %p para jogador ID %d"), hPipeDoJogadorParaFechar, id_para_remover);
+                            FlushFileBuffers(hPipeDoJogadorParaFechar); 
+                            DisconnectNamedPipe(hPipeDoJogadorParaFechar);
+                            CloseHandle(hPipeDoJogadorParaFechar);       
+
+                            if (WaitForSingleObject(g->listaJogadores->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
+                                if (jogador_idx != -1 && jogador_idx < g->listaJogadores->num_jogadores &&
+                                    g->listaJogadores->jogadores[jogador_idx].id_jogador == id_para_remover) {
+                                    g->listaJogadores->jogadores[jogador_idx].hPipeCliente = INVALID_HANDLE_VALUE; // Marcar como fechado
+                                }
+                                ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
+                            }
+                            StringCchPrintf(output_buffer, _countof(output_buffer), _T("Jogador %s (ID: %d) desconectado pelo administrador."), nome_jogador_removido, id_para_remover);
+                        }
+                        else 
+                            StringCchPrintf(output_buffer, _countof(output_buffer), _T("Jogador ID %d não encontrado ou já sem pipe válido."), id_para_remover);
+                    }
+                    else 
+                        StringCchPrintf(output_buffer, _countof(output_buffer), _T("Erro ao aceder à lista de jogadores para excluir ID %d."), id_para_remover);
+                }
+                else // ID inválido
+                    StringCchPrintf(output_buffer, _countof(output_buffer), _T("ID do jogador inválido para /excluir. Uso: /excluir <id_numerico>"));
+            }
+            else // Sem argumento
+                StringCchPrintf(output_buffer, _countof(output_buffer), _T("Uso: /excluir <id_jogador>"));
+            
+            escreverOutput(g, _T("%s"), output_buffer);
+            break;
+        } // Fim do case excluir
+        case encerrar:
+            escreverOutput(g, _T("Comando /encerrar recebido. Servidor a desligar..."));
+            run = false;
+            if (WaitForSingleObject(g->listaJogadores->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
+                for (int i = 0; i < g->listaJogadores->num_jogadores; i++) {
+                    if (g->listaJogadores->jogadores[i].hPipeCliente != INVALID_HANDLE_VALUE) {
+                        enviarMensagemPipe(g->listaJogadores->jogadores[i].hPipeCliente, COMANDO_DESLIGAR_CLIENTE);
+                        FlushFileBuffers(g->listaJogadores->jogadores[i].hPipeCliente);
+                        DisconnectNamedPipe(g->listaJogadores->jogadores[i].hPipeCliente);
+                        CloseHandle(g->listaJogadores->jogadores[i].hPipeCliente);
+                    }
+                }
+                ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
+			}
+			escreverOutput(g, _T("Todos os clientes foram notificados para desconectar."));
+            break;
+        case invalido_admin:
+        default:
+            StringCchPrintf(output_buffer, _countof(output_buffer), _T("Comando de administrador desconhecido: '%s'\nComandos: /listar, /excluir <id>, /encerrar, ..."), tokenComando);
+            escreverOutput(g, _T("%s"), output_buffer);
+            break;
+        }
+
+        if (run && cmdAdmin != encerrar) {
+            if (WaitForSingleObject(g->hConsoleOutputMutex, INFINITE) == WAIT_OBJECT_0) {
+                _tprintf(_T("\r%*s\r"), 80, _T(""));
+                _tprintf(prompt);
+                fflush(stdout);
+                ZeroMemory(g->adminInputLine, sizeof(g->adminInputLine));
+                ReleaseMutex(g->hConsoleOutputMutex);
+            }
+        }
+
+    } // fim do while(run)
+
+    LOG_DEBUG(_T("Thread Admin Console terminando."));
+    return 0;
+}
+
 void offArbitro(globais *g) {
 	if (g->mp->dados != NULL) UnmapViewOfFile(g->mp->dados);
 	if (g->mp->mapFile != NULL) CloseHandle(g->mp->mapFile);
 	if (g->mp->hMutex != NULL) CloseHandle(g->mp->hMutex);
     if (g->mp->hEvento != NULL) CloseHandle(g->mp->hEvento);
+	if (g->hConsoleOutputMutex != NULL) CloseHandle(g->hConsoleOutputMutex);
 	if (g->listaJogadores->g_hMutexJogadores != NULL) CloseHandle(g->listaJogadores->g_hMutexJogadores);
     g->mp->dados = NULL;
     g->mp->mapFile = NULL;
@@ -684,12 +949,6 @@ int setup(globais* g) {
         erro++;
 	}
 
-	if (erro > 0) {
-		_tprintf(_T("ERRO: O árbitro não pôde ser iniciado devido a erros de configuração.\n"));
-		offArbitro(g);
-		return erro;
-	}
-
 	g->listaJogadores->num_jogadores = 0;
 	g->listaJogadores->prox_id_jogador = 1;
 
@@ -705,6 +964,7 @@ int _tmain(int argc, LPTSTR argv[]) {
 
 #ifdef UNICODE
     _setmode(_fileno(stdout), _O_WTEXT);
+    _setmode(_fileno(stdin), _O_WTEXT);
     _setmode(_fileno(stderr), _O_WTEXT);
 #endif
 
@@ -715,6 +975,9 @@ int _tmain(int argc, LPTSTR argv[]) {
 
 	globals.mp = &mp;
 	globals.listaJogadores = &listaJogadores;
+    globals.hConsoleOutputMutex = CreateMutex(NULL, FALSE, _T("ConsoleOutputMutex"));
+    ZeroMemory(globals.adminInputLine, sizeof(globals.adminInputLine));
+    globals.adminInputCursorPos = 0;
 	
 	LOG_DEBUG(_T("Iniciando o árbitro..."));
 
@@ -731,14 +994,16 @@ int _tmain(int argc, LPTSTR argv[]) {
 
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
-	HANDLE hThreads[2];
-	hThreads[0] = CreateThread(NULL, 0, threadGeradorLetras, globals.mp, 0, NULL);
-	hThreads[1] = CreateThread(NULL, 0, threadGereCliente, &globals, 0, NULL);
+    HANDLE hThreads[3]; 
+    hThreads[0] = CreateThread(NULL, 0, threadGeradorLetras, &globals, 0, NULL);
+    hThreads[1] = CreateThread(NULL, 0, threadGereCliente, &globals, 0, NULL);
+    hThreads[2] = CreateThread(NULL, 0, threadAdminConsole, &globals, 0, NULL);
 
-	if (hThreads[0] == NULL || hThreads[1] == NULL) {
+	if (hThreads[0] == NULL || hThreads[1] == NULL || hThreads[2] == NULL) {
 		_tprintf(_T("ERRO: Falha ao criar threads (%lu).\n"), GetLastError());
 		if (hThreads[0] != NULL) CloseHandle(hThreads[0]);
 		if (hThreads[1] != NULL) CloseHandle(hThreads[1]);
+		if (hThreads[2] != NULL) CloseHandle(hThreads[2]);
 		offArbitro(&globals);
 		return 1;
 	}
@@ -746,6 +1011,7 @@ int _tmain(int argc, LPTSTR argv[]) {
 	WaitForMultipleObjects(2, hThreads, TRUE, INFINITE);
 	CloseHandle(hThreads[0]);
 	CloseHandle(hThreads[1]);
+	CloseHandle(hThreads[2]);
 
     offArbitro(&globals);
     return 0;
