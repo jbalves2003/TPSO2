@@ -8,11 +8,33 @@
 #include <stdbool.h>
 #include "mp.h"
 
+//#define DEBUG_MODE 
+
+#ifdef DEBUG_MODE
+    #define LOG_DEBUG(format, ...) _tprintf(_T("[DEBUG] :%d: " format _T("\n")), __LINE__, ##__VA_ARGS__)
+#else
+    #define LOG_DEBUG(FORMAT, ...)
+#endif
+
+
 #define PIPE_NAME _T("\\\\.\\pipe\\pipe")
-#define BUFFER_SIZE 512
+
 
 #define MAX_CONSOLE_EVENTS 128
-#define INPUT_BUFFER_SIZE 64
+#define INPUT_BUFFER_SIZE 512
+#define BUFFER_SIZE 512
+
+#define LINHA_LETRAS_ALEATORIAS 0 // Linha onde as letras aleatórias serão impressas
+
+#define LINHA_INPUT_CLIENTE 2 // Linha onde o input do cliente será lido
+#define PROMPT_INPUT _T("input> ") // Prompt para o input do cliente
+
+#define LINHA_MENSAGENS_SERVIDOR 4 // Linha onde as mensagens do servidor serão impressas
+#define COMANDO_DESLIGAR_CLIENTE _T("/sair") // Comando para desligar o cliente
+
+
+#define NOME_MUTEX_CONSOLE NULL
+
 
 volatile bool run = true;
 
@@ -32,9 +54,9 @@ typedef struct {
 	DWORD originalStdInMode; // Para guardar o modo original do stdin
 	HANDLE hStdout;
 	CONSOLE_CURSOR_INFO originalCursorInfo;
+	HANDLE hMutexConsole; // Mutex para proteger a consola 
 } globais;
 
-// Fncao para limpar linha da consola
 void limparLinha(SHORT y, HANDLE hStdout) {
     COORD coord = { 0, y };
 
@@ -53,7 +75,7 @@ void moverCursor(SHORT x, SHORT y, HANDLE hStdout) {
 }
 
 void imprimirVetor(TCHAR* letras, HANDLE hStdout) {
-    COORD coord = { 0, 0 }; // Coordenada de início
+    COORD coord = { 0, LINHA_LETRAS_ALEATORIAS };
     CONSOLE_SCREEN_BUFFER_INFO csbi;
 
     if (!GetConsoleScreenBufferInfo(hStdout, &csbi)) return;
@@ -78,20 +100,25 @@ void imprimirVetor(TCHAR* letras, HANDLE hStdout) {
     fflush(stdout);
 }
 
-DWORD threadLetrasOutput(LPVOID lpParam) {
+DWORD WINAPI threadLetrasOutput(LPVOID lpParam) {
     globais* g = (globais*)lpParam;
 
-    Sleep(200);
-
     while (run) {
-        if (WaitForSingleObject(g->hEvento, INFINITE) == WAIT_OBJECT_0) {
+
+        if (!run) break;
+
+        if (WaitForSingleObject(g->hEvento, 500) == WAIT_OBJECT_0) {
             if (WaitForSingleObject(g->hMutex, INFINITE) == WAIT_OBJECT_0) {
-                // limparLinha(0, g->hConsole);
+
                 TCHAR letrasCopia[MAXLETRAS];
                 memcpy(letrasCopia, g->dados->letras, MAXLETRAS * sizeof(TCHAR));
+
                 ReleaseMutex(g->hMutex);
 
-                imprimirVetor(letrasCopia, g->hStdout);
+                if (WaitForSingleObject(g->hMutexConsole, INFINITE) == WAIT_OBJECT_0) {
+                    imprimirVetor(letrasCopia, g->hStdout);
+                    ReleaseMutex(g->hMutexConsole);
+                }
             }
         }
     }
@@ -99,16 +126,20 @@ DWORD threadLetrasOutput(LPVOID lpParam) {
 }
 
 BOOL createPipe(globais* g) {
-    return g->hpipe = CreateFile(
-        PIPE_NAME,      // nome do pipe (o mesmo do Arbitro)
-        GENERIC_WRITE | GENERIC_READ,  // acesso de ESCRITA e LEIITURA
-        0,              // sem partilha
-        NULL,           // segurança default
-        OPEN_EXISTING,  // SÓ abre se o pipe JÁ EXISTIR (criado pelo Arbitro)
-        0,              // atributos default
-        NULL);          // sem template;
+    if (g == NULL) return FALSE;
+
+    g->hpipe = CreateFile(
+        PIPE_NAME,                    // Nome do pipe
+        GENERIC_READ | GENERIC_WRITE, // Acesso para ler e escrever
+		0,                            // dwShareMode: sem compartilhamento
+        NULL,                         // lpSecurityAttributes: segurança default
+        OPEN_EXISTING,                // Abrir apenas se o pipe já existir (criado pelo servidor)
+        0,                            // dwFlagsAndAttributes: I/O síncrono padrão
+        NULL);                        // hTemplateFile: não usado para pipes
 
     if (g->hpipe == INVALID_HANDLE_VALUE) {
+        LOG_DEBUG(_T("createPipe: ERRO ao conectar ao pipe '%s'. Código GetLastError(): %lu\n"),
+            PIPE_NAME, GetLastError());
         g->hpipe = NULL;
         return FALSE;
     }
@@ -116,108 +147,191 @@ BOOL createPipe(globais* g) {
     return TRUE;
 }
 
-BOOL enviarComando(HANDLE hpipe, const TCHAR* msg) {
-    DWORD bytesWritten;
-    BOOL result = WriteFile(hpipe, msg, (DWORD)(_tcslen(msg) + 1) * sizeof(TCHAR), &bytesWritten, NULL);
-    if (!result)
-        _tprintf(_T("ERRO: Falha ao enviar mensagem pelo pipe (%lu).\n"), GetLastError());
+BOOL enviarMensagemPipe(HANDLE hpipe, const TCHAR* mensagem) {
+    if (hpipe == NULL || hpipe == INVALID_HANDLE_VALUE || mensagem == NULL) return FALSE;
+
+    DWORD bytesOutput = (DWORD)(_tcslen(mensagem) + 1) * sizeof(TCHAR);
+    DWORD bytesWritten = 0;
+
+    BOOL result = WriteFile(hpipe, mensagem, bytesOutput, &bytesWritten, NULL);
+
+    if (!result) 
+        LOG_DEBUG(_T("CLIENTE ERRO (enviarComando): Falha ao enviar mensagem '%s' pelo pipe (%lu).\n"), mensagem, GetLastError());
+    else if (bytesWritten != bytesOutput) {
+        LOG_DEBUG(_T("CLIENTE AVISO (enviarComando): Nem todos os bytes foram enviados para '%s'. (Esperado: %lu, Escrito: %lu)\n"), mensagem, bytesOutput, bytesWritten);
+		//pensar nessa logica, talvez nao mandar aviso se o servidor nao espera por todos os bytes ou se o pipe nao estiver configurado para esperar por todos os bytes
+        return FALSE; 
+    }
     return result;
 }
 
 DWORD WINAPI threadEscutarInput(LPVOID lpParam) {
-	globais* g = (globais*)lpParam;
+    globais* g = (globais*)lpParam;
+	LOG_DEBUG(_T("threadEscutarInput: Iniciando threadEscutarInput...\n"));
 
-    INPUT_RECORD inputRecord[MAX_CONSOLE_EVENTS]; // Buffer para eventos de input
+	INPUT_RECORD inputRecord[MAX_CONSOLE_EVENTS]; // Buffer para eventos de input
     DWORD numEventsRead;
-    TCHAR userInputBuffer[INPUT_BUFFER_SIZE]; // Buffer para guardar o texto digitado
-    DWORD userInputLen = 0; // Comprimento atual do texto digitado
+	TCHAR userInputBuffer[INPUT_BUFFER_SIZE];
+	DWORD userInputLen = 0; 
 
-    const SHORT INPUT_LINE = 2; // Linha para input
-    TCHAR prompt[] = _T("input>"); // Ajustado
+    TCHAR comandoParaEnviar[INPUT_BUFFER_SIZE];
+    BOOL deveEnviarComando = FALSE;
+
+    TCHAR prompt[] = PROMPT_INPUT;
     DWORD promptLen = (DWORD)_tcslen(prompt);
     DWORD lenWritten;
 
-    // Escrever o prompt inicial
-    COORD promptCoord = { 0, INPUT_LINE };
-    limparLinha(INPUT_LINE, g->hStdout);
-    WriteConsoleOutputCharacter(g->hStdout, prompt, promptLen, promptCoord, &lenWritten);
+    COORD promptCoord = { 0, LINHA_INPUT_CLIENTE };
     SHORT inputStartX = (SHORT)promptLen;
 
-    moverCursor(inputStartX, INPUT_LINE, g->hStdout); // Posicionar cursor inicial
+    // Escrever prompt inicial (protegido)
+    if (WaitForSingleObject(g->hMutexConsole, INFINITE) == WAIT_OBJECT_0) {
+        limparLinha(LINHA_INPUT_CLIENTE, g->hStdout);
+        WriteConsoleOutputCharacter(g->hStdout, prompt, promptLen, promptCoord, &lenWritten);
+        moverCursor(inputStartX, LINHA_INPUT_CLIENTE, g->hStdout);
+        ReleaseMutex(g->hMutexConsole);
+    }
 
     while (run) {
+        deveEnviarComando = FALSE; // Resetar flag
 
         if (!ReadConsoleInput(g->hStdin, inputRecord, MAX_CONSOLE_EVENTS, &numEventsRead)) {
-            if (run) { _tprintf(_T("Erro ReadConsoleInput (%lu)\n"), GetLastError()); }
+            LOG_DEBUG(_T("threadEscutarInput: Erro ReadConsoleInput (%lu)\n"), GetLastError());
             run = false;
             continue;
         }
 
         // Processar cada evento lido
         for (DWORD i = 0; i < numEventsRead; ++i) {
-            // Apenas processar eventos de teclado e quando a tecla é pressionada
-            if (inputRecord[i].EventType == KEY_EVENT &&
-                inputRecord[i].Event.KeyEvent.bKeyDown)
+            if (inputRecord[i].EventType == KEY_EVENT && 
+                inputRecord[i].Event.KeyEvent.bKeyDown) 
             {
-                TCHAR ch = inputRecord[i].Event.KeyEvent.uChar.UnicodeChar;
-                WORD vkCode = inputRecord[i].Event.KeyEvent.wVirtualKeyCode;
+                if (WaitForSingleObject(g->hMutexConsole, INFINITE) == WAIT_OBJECT_0) {
+					LOG_DEBUG(_T("threadEscutarInput: Evento de tecla pressionada detectado.\n"));
+                    TCHAR ch = inputRecord[i].Event.KeyEvent.uChar.UnicodeChar;
+                    WORD vkCode = inputRecord[i].Event.KeyEvent.wVirtualKeyCode;
 
-                // ---Lidar com Teclas ---
-                if (vkCode == VK_RETURN) { // Enter Pressionado
+					if (vkCode == VK_RETURN) { // Tecla Enter
+						LOG_DEBUG(_T("threadEscutarInput: Tecla Enter pressionada.\n"));
+                        userInputBuffer[userInputLen] = _T('\0');
 
-                    userInputBuffer[userInputLen] = _T('\0');
-                    if ((_tcsicmp(userInputBuffer, _T("/sair")) == 0)) {
-                        _tprintf(_T("\n'comando de saida local' detectado. Terminando...\n"));
-                        run = false;
-					}
-					else if (userInputLen > 0) {
-						// Enviar o comando para o pipe
-						if (!enviarComando(g->hpipe, userInputBuffer)) {
-                            _tprintf(_T("Falha ao enviar comando pelo pipe.\n"));
+                        if (userInputLen > 0) {
+                            _tcscpy_s(comandoParaEnviar, INPUT_BUFFER_SIZE, userInputBuffer);
+                            deveEnviarComando = TRUE;
+                        }
+
+                        userInputLen = 0;
+                        userInputBuffer[0] = _T('\0');
+                        moverCursor(0, LINHA_INPUT_CLIENTE, g->hStdout);
+                        limparLinha(LINHA_INPUT_CLIENTE, g->hStdout);
+
+                        WriteConsoleOutputCharacter(g->hStdout, prompt, promptLen, promptCoord, &lenWritten);
+                        moverCursor(inputStartX, LINHA_INPUT_CLIENTE, g->hStdout);
+                    }
+					else if (vkCode == VK_BACK) { // Tecla Backspace
+                        if (userInputLen > 0) {
+                            userInputLen--;
+                            SHORT currentX = inputStartX + (SHORT)userInputLen;
+                            COORD backspaceCoord = { currentX, LINHA_INPUT_CLIENTE };
+                            
+                            WriteConsoleOutputCharacter(g->hStdout, _T(" "), 1, backspaceCoord, &lenWritten);
+                            moverCursor(currentX, LINHA_INPUT_CLIENTE, g->hStdout);
+
+                            userInputBuffer[userInputLen] = _T('\0');
+                        }
+                    }
+					else if (ch >= _T(' ') && userInputLen < INPUT_BUFFER_SIZE - 1) {
+                        userInputBuffer[userInputLen] = ch;
+
+                        SHORT currentX = inputStartX + (SHORT)userInputLen;
+                        COORD charCoord = { currentX, LINHA_INPUT_CLIENTE };
+                        
+                        WriteConsoleOutputCharacter(g->hStdout, &ch, 1, charCoord, &lenWritten);
+                        moverCursor(currentX + 1, LINHA_INPUT_CLIENTE, g->hStdout);
+
+                        userInputLen++;
+                    }
+                    ReleaseMutex(g->hMutexConsole);
+                }
+
+                if (deveEnviarComando) {
+                        if (!enviarMensagemPipe(g->hpipe, comandoParaEnviar)) {
+							LOG_DEBUG(_T("threadEscutarInput: Falha ao enviar comando '%s' pelo pipe.\n"), comandoParaEnviar);
                             run = false;
                         }
-					}
-
-                    userInputLen = 0;
-                    userInputBuffer[0] = _T('\0');
-                    moverCursor(0, INPUT_LINE, g->hStdout);
-                    limparLinha(INPUT_LINE, g->hStdout);
-
-                    WriteConsoleOutputCharacter(g->hStdout, prompt, promptLen, promptCoord, &lenWritten);
-                    moverCursor(inputStartX, INPUT_LINE, g->hStdout);
-
+                    comandoParaEnviar[0] = _T('\0');
+                    deveEnviarComando = FALSE;
                 }
-                else if (vkCode == VK_BACK) { // Backspace Pressionado
-                    if (userInputLen > 0) {
-                        userInputLen--;
-                        SHORT currentX = inputStartX + (SHORT)userInputLen;
-                        COORD backspaceCoord = { currentX, INPUT_LINE };
 
-                        WriteConsoleOutputCharacter(g->hStdout, _T(" "), 1, backspaceCoord, &lenWritten);
+            } // Fim if (evento de tecla)
+        } // Fim for (eventos)
+    } // Fim while(run)
 
-                        moverCursor(currentX, INPUT_LINE, g->hStdout);
-                    }
-                }
-                else if (ch >= _T(' ') && userInputLen < INPUT_BUFFER_SIZE - 1) {
-                    userInputBuffer[userInputLen] = ch;
-
-                    SHORT currentX = inputStartX + (SHORT)userInputLen;
-                    COORD charCoord = { currentX, INPUT_LINE };
-
-                    WriteConsoleOutputCharacter(g->hStdout, &ch, 1, charCoord, &lenWritten);
-
-                    userInputLen++;
-
-                    moverCursor(currentX + 1, INPUT_LINE, g->hStdout);
-                }
-            }
-        }
-
-        Sleep(100);
+    if (WaitForSingleObject(g->hMutexConsole, INFINITE) == WAIT_OBJECT_0) {
+        limparLinha(LINHA_INPUT_CLIENTE, g->hStdout);
+        ReleaseMutex(g->hMutexConsole);
     }
+    return 0;
+}
 
-    limparLinha(INPUT_LINE, g->hStdout);
-    SetConsoleCursorInfo(g->hStdout, &g->originalCursorInfo);
+DWORD WINAPI receberComandosPipe(LPVOID lpParam) {
+    globais* g = (globais*)lpParam;
+	LOG_DEBUG(_T("receberComandosPipe: Iniciando thread receberComandosPipe...\n"));
+
+    TCHAR buffer[BUFFER_SIZE];
+    HANDLE hMutexConsole = g->hMutexConsole;
+
+    if (g == NULL || g->hpipe == NULL || g->hpipe == INVALID_HANDLE_VALUE) return 1;
+    
+    while (run) {
+        if (!run) break;
+
+        DWORD bytesDisponiveis = 0;
+        DWORD msgBytes = 0;
+
+        // Espreitar o pipe
+        BOOL peekResult = PeekNamedPipe(
+            g->hpipe,
+            NULL,               // buffer (não queremos ler dados aqui)
+            0,                  // buffer size
+            NULL,               // bytes peeked
+            &bytesDisponiveis,  // total bytes available
+            &msgBytes           // bytes in next message
+        );
+
+        if (!run) break;
+        if (!peekResult) {run = false; continue; } // Assume que a conexão foi perdida
+
+        if (msgBytes > 0) {
+			LOG_DEBUG(_T("receberComandosPipe: Dados disponíveis no pipe. Bytes disponíveis: %lu, Bytes na próxima mensagem: %lu\n"), bytesDisponiveis, msgBytes);
+            DWORD bytesRead = 0;
+            
+            BOOL mensagemServidor = ReadFile(
+                g->hpipe,
+                buffer,
+                (sizeof(buffer) / sizeof(TCHAR) - 1) * sizeof(TCHAR),
+                &bytesRead,
+                NULL);
+
+            if (!run) break;
+
+            if (mensagemServidor && bytesRead > 0) {
+				LOG_DEBUG(_T("receberComandosPipe: Mensagem recebida do servidor. Bytes lidos: %lu\n"), bytesRead);
+                buffer[bytesRead / sizeof(TCHAR)] = _T('\0');
+                
+                if (hMutexConsole && WaitForSingleObject(hMutexConsole, INFINITE) == WAIT_OBJECT_0) {
+                    limparLinha(LINHA_MENSAGENS_SERVIDOR, g->hStdout);
+                    moverCursor(0, LINHA_MENSAGENS_SERVIDOR, g->hStdout);
+                    _tprintf(_T("Servidor: %s"), buffer);
+                    fflush(stdout);
+                    ReleaseMutex(hMutexConsole);
+                }
+                if (_tcsicmp(buffer, COMANDO_DESLIGAR_CLIENTE) == 0) run = false;
+            }
+            else run = false;
+        }
+        else Sleep(200);
+    } // Fim while(run)
     return 0;
 }
 
@@ -240,6 +354,7 @@ void offJogador(globais* g) {
 	if (g->mapFile != NULL) CloseHandle(g->mapFile);
 	if (g->hMutex != NULL) CloseHandle(g->hMutex);
 	if (g->hEvento != NULL) CloseHandle(g->hEvento);
+	if (g->hMutexConsole != NULL) CloseHandle(g->hMutexConsole);
 	if (g->hStdin != NULL) SetConsoleMode(g->hStdin, g->originalStdInMode);
 	g->originalCursorInfo.bVisible = TRUE;
 	if (g->hStdout != NULL) SetConsoleCursorInfo(g->hStdout, &g->originalCursorInfo);
@@ -249,90 +364,140 @@ void offJogador(globais* g) {
 	g->mapFile = NULL;
 	g->hMutex = NULL;
 	g->hEvento = NULL;
+	g->hMutexConsole = NULL;
     SetConsoleCtrlHandler(CtrlHandler, FALSE); // Desregistar
 }
 
 int setup(globais* g) {
-    int erro = 0;
-    
+    int erros = 0;
+
+	LOG_DEBUG(_T("SETUP: Iniciando setup...\n"));
+
+    // Registar CtrlHandler
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) 
-        _tprintf(_T("ERRO: Não foi possível definir o handler da consola.\n"));
-    
+        LOG_DEBUG(_T("SETUP: Não foi possível definir o handler da consola (%lu).\n"), GetLastError());
+    else
+        LOG_DEBUG(_T("SETUP: CtrlHandler registado.\n"));
+
+    // Obter Handles Standard da Consola
     g->hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-    g->hStdin = GetStdHandle(STD_INPUT_HANDLE);    // Para modos de consola
+    LOG_DEBUG(_T("SETUP: GetStdHandle(STD_OUTPUT_HANDLE) retornou: %p\n"), g->hStdout);
+    g->hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    LOG_DEBUG(_T("SETUP: GetStdHandle(STD_INPUT_HANDLE) retornou: %p\n"), g->hStdin);
+
     if (g->hStdout == INVALID_HANDLE_VALUE || g->hStdin == INVALID_HANDLE_VALUE) {
-        _tprintf(_T("ERRO: Não foi possível obter handles da consola.\n"));
-		erro++;
-		return -1;
+        LOG_DEBUG(_T("SETUP ERRO FATAL: Não foi possível obter handles da consola (Stdout/Stdin). GetLastError: %lu\n"), GetLastError());
+        return -1;
+    }
+    LOG_DEBUG(_T("SETUP: Handles Stdout/Stdin obtidos com sucesso.\n"));
+
+    // Criar Mutex da Consola
+    g->hMutexConsole = CreateMutex(NULL, FALSE, NOME_MUTEX_CONSOLE);
+    if (g->hMutexConsole == NULL) {
+        LOG_DEBUG(_T("SETUP ERRO FATAL: Falha ao criar Mutex da Consola (%lu).\n"), GetLastError());
+        return -2;
+    }
+    LOG_DEBUG(_T("SETUP: Mutex da consola criado com sucesso.\n"));
+
+    // Configurar Cursor (Esconder)
+    LOG_DEBUG(_T("SETUP: Tentando obter mutex da consola para config do cursor...\n"));
+    if (WaitForSingleObject(g->hMutexConsole, 5000) == WAIT_OBJECT_0) {
+        LOG_DEBUG(_T("SETUP: Mutex da consola obtido para config do cursor.\n"));
+        if (!GetConsoleCursorInfo(g->hStdout, &g->originalCursorInfo)) {
+            LOG_DEBUG(_T("SETUP ERRO: Não foi possível obter info original do cursor (%lu).\n"), GetLastError());
+            erros++;
+        }
+        else {
+            LOG_DEBUG(_T("SETUP: Info original do cursor obtida.\n"));
+            CONSOLE_CURSOR_INFO tempCursorInfo = g->originalCursorInfo;
+            tempCursorInfo.bVisible = FALSE;
+
+            if (!SetConsoleCursorInfo(g->hStdout, &tempCursorInfo))
+                LOG_DEBUG(_T("SETUP: Não foi possível esconder o cursor (%lu).\n"), GetLastError());
+            else
+                LOG_DEBUG(_T("SETUP: Cursor escondido.\n"));
+        }
+        ReleaseMutex(g->hMutexConsole);
+        LOG_DEBUG(_T("SETUP: Mutex da consola libertado após config do cursor.\n"));
+    }
+    else {
+        LOG_DEBUG(_T("SETUP ERRO: Falha ao obter mutex da consola para config do cursor. GetLastError(): %lu\n"), GetLastError());
+        erros++;
     }
 
-    if (!GetConsoleCursorInfo(g->hStdout, &g->originalCursorInfo)) {
-        _tprintf(_T("ERRO: Não foi possível obter info do cursor.\n"));
-		erro++;
+    // Configurar Modo da Consola de Input (Stdin)
+    DWORD currentStdInModeVal = 0;
+
+    LOG_DEBUG(_T("SETUP: Prestes a chamar GetConsoleMode para Stdin (Handle: %p).\n"), g->hStdin);
+    if (g->hStdin == INVALID_HANDLE_VALUE || g->hStdin == NULL) {
+        LOG_DEBUG(_T("SETUP ERRO: Handle Stdin inválido antes de GetConsoleMode.\n"));
+        erros++;
+    }
+    else if (!GetConsoleMode(g->hStdin, &currentStdInModeVal)) {
+        LOG_DEBUG(_T("SETUP ERRO: Não foi possível obter modo do stdin (%lu).\n"), GetLastError());
+        erros++;
+    }
+    else {
+        LOG_DEBUG(_T("SETUP: GetConsoleMode OK. Modo atual do stdin: %lu (0x%lX)\n"), currentStdInModeVal, currentStdInModeVal);
+        g->originalStdInMode = currentStdInModeVal;
+        DWORD newStdInMode = g->originalStdInMode;
+
+        newStdInMode &= ~(ENABLE_QUICK_EDIT_MODE | ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+        
+        LOG_DEBUG(_T("SETUP: Tentando definir novo modo do stdin: %lu (0x%lX)\n"), newStdInMode, newStdInMode);
+        if (!SetConsoleMode(g->hStdin, newStdInMode))
+            LOG_DEBUG(_T("SETUP AVISO: Não foi possível definir novo modo do stdin (%lu).\n"), GetLastError());
+        else
+            LOG_DEBUG(_T("SETUP: Novo modo do stdin definido com sucesso.\n"));
     }
 
-    g->originalCursorInfo.bVisible = FALSE;
-    if (!SetConsoleCursorInfo(g->hStdout, &g->originalCursorInfo))
-        _tprintf(_T("AVISO: Não foi possível esconder o cursor.\n"));
-
-    DWORD currentStdInMode;
-    if (!GetConsoleMode(g->hStdin, &currentStdInMode)) {
-        _tprintf(_T("ERRO: Não foi possível obter modo da consola de input.\n"));
-		erro++;
-    }
-
-    g->originalStdInMode = currentStdInMode;
-    DWORD newStdInMode = g->originalStdInMode;
-
-    newStdInMode &= ~ENABLE_QUICK_EDIT_MODE;
-    newStdInMode &= ~ENABLE_ECHO_INPUT;      // <<< DESLIGAR ECHO
-    newStdInMode &= ~ENABLE_LINE_INPUT;      // <<< DESLIGAR MODO LINHA
-    newStdInMode |= ENABLE_EXTENDED_FLAGS;
-
-    if (!SetConsoleMode(g->hStdin, newStdInMode))
-        _tprintf(_T("AVISO: Não foi possível desativar QuickEdit Mode.\n"));
-
+    // Abrir Recursos da Memória Partilhada
+    LOG_DEBUG(_T("SETUP: Abrindo recursos da Memória Partilhada...\n"));
     g->hMutex = OpenMutex(SYNCHRONIZE, FALSE, NOME_MUTEX);
-    if (g->hMutex == NULL) {
-        _tprintf(_T("ERRO: Falha ao criar Mutex.\n"));
-		erro++;
+    if (g->hMutex == NULL) { 
+        LOG_DEBUG(_T("SETUP ERRO: Falha ao abrir Mutex da MP '%s' (%lu).\n"), NOME_MUTEX, GetLastError()); 
+        erros++; 
     }
+    else 
+        LOG_DEBUG(_T("SETUP: Mutex da MP aberto.\n"));
 
     g->hEvento = OpenEvent(SYNCHRONIZE, FALSE, NOME_EVENTO);
-    if (g->hEvento == NULL) {
-        _tprintf(_T("ERRO: Falha ao criar Evento (%lu).\n"), GetLastError());
-		erro++;
+    if (g->hEvento == NULL) { 
+        LOG_DEBUG(_T("SETUP ERRO: Falha ao abrir Evento da MP '%s' (%lu).\n"), NOME_EVENTO, GetLastError()); 
+        erros++; 
     }
+    else 
+        LOG_DEBUG(_T("SETUP: Evento da MP aberto.\n"));
 
-    g->mapFile = OpenFileMapping(
-        FILE_MAP_READ,
-        FALSE,
-        NOME_MP
-    );
+    g->mapFile = OpenFileMapping(FILE_MAP_READ, FALSE, NOME_MP);
     if (g->mapFile == NULL) {
-        _tprintf(_T("ERRO: Falha ao criar o arquivo de mapeamento (%lu).\n"), GetLastError());
-		erro++;
+        LOG_DEBUG(_T("SETUP ERRO: Falha ao abrir Mapeamento de Ficheiro da MP '%s' (%lu).\n"), NOME_MP, GetLastError());
+        erros++;
+    }
+    else {
+        LOG_DEBUG(_T("SETUP: Mapeamento de Ficheiro da MP aberto.\n"));
+        g->dados = (MP*)MapViewOfFile(g->mapFile, FILE_MAP_READ, 0, 0, sizeof(MP));
+        if (g->dados == NULL) {
+            LOG_DEBUG(_T("SETUP ERRO: Falha ao mapear View da MP '%s' (%lu).\n"), NOME_MP, GetLastError());
+            erros++;
+        }
+        else
+            LOG_DEBUG(_T("SETUP: View da MP mapeada.\n"));
     }
 
-    g->dados = (MP*)MapViewOfFile(
-        g->mapFile,
-        FILE_MAP_READ,
-        0,
-        0,
-        sizeof(MP));
-    if (g->dados == NULL) {
-        _tprintf(_T("ERRO: Falha ao mapear o arquivo (%lu).\n"), GetLastError());
-		erro++;
+    // Conectar ao Pipe do Servidor
+    if (!createPipe(g)) { 
+        LOG_DEBUG(_T("SETUP ERRO: Falha ao conectar ao pipe do servidor.\n"));
+        erros++;
     }
 
-    if (!createPipe(g)) {
-        _tprintf(_T("ERRO: Falha ao criar pipe (%lu).\n"), GetLastError());
-        erro++;
-    }
+    if (erros > 0)
+        LOG_DEBUG(_T("SETUP: Setup concluído com %d erro(s).\n"), erros);
+    else
+        LOG_DEBUG(_T("SETUP: Setup concluído com sucesso.\n"));
 
-	return erro;
+    return erros;
 }
-
 int _tmain(int argc, LPTSTR argv[]) {
 
 #ifdef UNICODE
@@ -343,20 +508,25 @@ int _tmain(int argc, LPTSTR argv[]) {
 
     globais g = { 0 };
 
-	int erro = setup(&g);
-	if (erro != 0) {
-		offJogador(&g);
-		return erro;
-	}
+    LOG_DEBUG(_T("CLIENTE: Chamando setup...\n"));
+    if (setup(&g) != 0) {
+        _tprintf(TEXT("Falha no setup. Encerrando.\n"));
+        offJogador(&g);
+        _tprintf(TEXT("\nPressione Enter para sair.\n"));
+        _gettchar();
+        return -1;
+    }
 
     HANDLE hEscutarInput = CreateThread(NULL, 0, threadEscutarInput, &g, 0, NULL);
+	HANDLE hPipeRead = CreateThread(NULL, 0, receberComandosPipe, &g, 0, NULL);
     HANDLE hLetrasOutput = CreateThread(NULL, 0, threadLetrasOutput, &g, 0, NULL);
 
-    HANDLE hThreads[] = { hEscutarInput, hLetrasOutput };
+    HANDLE hThreads[] = { hEscutarInput, hLetrasOutput, hPipeRead };
     
-	if (hEscutarInput != NULL && hLetrasOutput != NULL) 
-       WaitForMultipleObjects(2, hThreads, TRUE, INFINITE);
+	if (hEscutarInput != NULL && hLetrasOutput != NULL && hPipeRead != NULL) 
+       WaitForMultipleObjects(3, hThreads, TRUE, INFINITE);
 
+	if (hPipeRead) CloseHandle(hPipeRead);
     if (hEscutarInput) CloseHandle(hEscutarInput);
     if (hLetrasOutput) CloseHandle(hLetrasOutput);
 	offJogador(&g);
