@@ -9,7 +9,7 @@
 #include <time.h>
 #include "mp.h"
 
-//#define DEBUG_MODE 
+#define DEBUG_MODE 
 
 #ifdef DEBUG_MODE
 #define LOG_DEBUG(format, ...) _tprintf(_T("[DEBUG] :%d: " format _T("\n")), __LINE__, ##__VA_ARGS__)
@@ -27,8 +27,9 @@ int g_NumeroDePalavrasNoDicionario = 0;
 #define BUFFER_SIZE 512
 
 #define RITMO 3 * 1000
-#define PONTUACAO_GANHA 10 // Pontuação por palavra correta
-#define PONTUACAO_PERDIDA 5 // Pontuação perdida por palavra errada
+#define PONTUACAO_GANHA 2 // Pontuação por palavra correta
+#define PONTUACAO_PERDIDA 1 // Pontuação perdida por palavra errada
+#define MIN_LETRAS_PARA_PONTUAR 2 // Mínimo de letras usadas para pontuar
 
 #define NAME_SIZE 20
 #define MAXJOGADORES 20
@@ -49,7 +50,6 @@ typedef struct {
 } memoria_partilhada;
 
 typedef struct {
-    HANDLE hPipeCliente;
     int id_jogador;
     TCHAR nome[NAME_SIZE];
     int pontos;
@@ -58,9 +58,23 @@ typedef struct {
 typedef struct {
     jogador jogadores[MAXJOGADORES];
     int num_jogadores;
+	int prox_id_jogador;
+    HANDLE g_hMutexJogadores;
 } lista_jogadores;
-lista_jogadores g_listaJogadores = { 0 };
-HANDLE g_hMutexJogadores = NULL;
+
+typedef struct {
+	memoria_partilhada* mp;
+    lista_jogadores* listaJogadores;
+} globais;
+
+typedef struct {
+    HANDLE hPipeCliente;
+    int id_jogador;
+    TCHAR nome[NAME_SIZE];
+	int pontos;
+
+	globais* g;
+}clienteAux;
 
 typedef enum {
     invalido_jogador = -1,
@@ -77,7 +91,7 @@ comando_jogador checkComandoJogador(const TCHAR* comando) {
 	if (_tcsicmp(comando, COMANDO_DESLIGAR_CLIENTE) == 0) return sair;
     if (_tcsicmp(comando, _T("/jogs")) == 0) return jogs;
     if (_tcsicmp(comando, _T("/pont")) == 0) return pont;
-	//if (_tcsicmp(comando[0], _T("/")) == 0) return invalido_jogador;
+	//if ((comando[0] == _T("/")) return invalido_jogador;
 	return palavra;
 }
 
@@ -162,101 +176,61 @@ void enviarMensagemPipe(HANDLE hPipe, const TCHAR* mensagem) {
         LOG_DEBUG(_T("Erro ao enviar comando '%s' pelo pipe: %lu\n"), mensagem, GetLastError());
 }
 
-TCHAR* listarJogadores() {
+TCHAR* listarJogadores(lista_jogadores* lista) {
     TCHAR* buffer = (TCHAR*)malloc(BUFFER_SIZE * sizeof(TCHAR));
     if (buffer == NULL) return NULL;
 	ZeroMemory(buffer, BUFFER_SIZE * sizeof(TCHAR));
 
-    if (WaitForSingleObject(g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
-
-        if (g_listaJogadores.num_jogadores == 0) {
-			StringCchCopy(buffer, BUFFER_SIZE, _T("Nenhum jogador conectado.\n"));
+    if (WaitForSingleObject(lista->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
+        if (lista->num_jogadores == 0) {
+            StringCchCopy(buffer, BUFFER_SIZE, _T("Nenhum jogador conectado.\n"));
         }
         else {
             StringCchCopy(buffer, BUFFER_SIZE, _T("Jogadores conectados:\n"));
-            for (int i = 0; i < g_listaJogadores.num_jogadores; i++) {
-                StringCchCat(buffer, BUFFER_SIZE, g_listaJogadores.jogadores[i].nome);
+            for (int i = 0; i < lista->num_jogadores; i++) {
+                StringCchCat(buffer, BUFFER_SIZE, lista->jogadores[i].nome);
                 StringCchCat(buffer, BUFFER_SIZE, _T("\n"));
             }
         }
-        ReleaseMutex(g_hMutexJogadores);
-
-    } else 
+        ReleaseMutex(lista->g_hMutexJogadores);
+    }
+    else
         LOG_DEBUG(_T("listarJogadores: ERRO ao aceder lista.\n"));
-    
-	return buffer;
+	
+    return buffer;
 }
 
-BOOL removerJogador(int id_jogador) {
+BOOL removerJogador(lista_jogadores* lista, int id_jogador) {
     if (id_jogador < 0) return FALSE;
 	LOG_DEBUG(_T("removerJogador: ID do jogador %d.\n"), id_jogador);
 
-    if (WaitForSingleObject(g_hMutexJogadores, INFINITE) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(lista->g_hMutexJogadores, INFINITE) != WAIT_OBJECT_0) {
 		LOG_DEBUG(_T("removerJogador: ERRO ao aceder lista de jogadores.\n"));
 		return FALSE;
 	}
-    if (g_listaJogadores.num_jogadores <= 0) {
-        ReleaseMutex(g_hMutexJogadores);
+    if (lista->num_jogadores<= 0) {
+        ReleaseMutex(lista->g_hMutexJogadores);
         return FALSE;
     }
 
-    for (int i = 0; i < g_listaJogadores.num_jogadores; i++) {
-        if (g_listaJogadores.jogadores[i].id_jogador == id_jogador) {
-            _tprintf(_T("Desconectando jogador: %s\n"), g_listaJogadores.jogadores[i].nome);
-            g_listaJogadores.jogadores[i] = g_listaJogadores.jogadores[--g_listaJogadores.num_jogadores];
-			ZeroMemory(&g_listaJogadores.jogadores[g_listaJogadores.num_jogadores - 1], sizeof(jogador));
-            break;
+    for (int i = 0; i < lista->num_jogadores; i++) {
+        if (lista->jogadores[i].id_jogador == id_jogador) {
+            if (i < lista->num_jogadores - 1) {
+                lista->jogadores[i] = lista->jogadores[lista->num_jogadores - 1];
+            }
+
+            lista->num_jogadores--;
+            ZeroMemory(&lista->jogadores[lista->num_jogadores], sizeof(jogador));
+
+            ReleaseMutex(lista->g_hMutexJogadores);
+            LOG_DEBUG(_T("removerJogador: Jogador ID %d removido com sucesso. num_jogadores agora é %d.\n"), id_jogador, lista->num_jogadores);
+            return TRUE;
         }
     }
 
-    ReleaseMutex(g_hMutexJogadores);
+    ReleaseMutex(lista->g_hMutexJogadores);
 	LOG_DEBUG(_T("removerJogador: Jogador %d removido com sucesso.\n"), id_jogador);
-	return TRUE;
-}
-
-int gerirComandoJogador(const TCHAR* comando, jogador* cliente) {
-    if (comando == NULL || cliente == NULL) return;
-    comando_jogador cmd = checkComandoJogador(comando);
-    TCHAR msgFormatada[BUFFER_SIZE];
-    switch (cmd) {
-        case sair:
-			if (!removerJogador(cliente->id_jogador))
-                enviarMensagemPipe(cliente->hPipeCliente, _T("Tente digitar o comando outra vez"));
-            else
-				enviarMensagemPipe(cliente->hPipeCliente, _T("/sair"));
-            return 1;
-            break;
-        case jogs:
-			LOG_DEBUG(_T("Jogador %s solicitou lista de jogadores."), cliente->nome);
-			TCHAR* lista = listarJogadores();
-			enviarMensagemPipe(cliente->hPipeCliente, lista);
-			free(lista);
-			lista = NULL;
-            break;
-        case pont:
-			LOG_DEBUG(_T("Jogador %s solicitou sua pontuação."), cliente->nome);
-            _stprintf_s(msgFormatada, _countof(msgFormatada), _T("Sua pontuacao atual: %d"), cliente->pontos);
-            enviarMensagemPipe(cliente->hPipeCliente, msgFormatada);
-            break;
-		case invalido_jogador:
-			LOG_DEBUG(_T("Comando inválido recebido do jogador %s: %s"), cliente->nome, comando);
-            enviarMensagemPipe(cliente->hPipeCliente, _T("/erro ComandoInvalido"));
-			break;
-        default:
-            if (palavraExisteNoDicionario(comando)) {
-                LOG_DEBUG(_T("Jogador %s digitou a palavra válida: %s"), cliente->nome, comando);
-                cliente->pontos += PONTUACAO_GANHA;
-                _stprintf_s(msgFormatada, _countof(msgFormatada), _T("Palavra '%s' aceita! Pontos atuais: %d"), comando, cliente->pontos);
-                enviarMensagemPipe(cliente->hPipeCliente, msgFormatada);
-            } else {
-                LOG_DEBUG(_T("Jogador %s digitou a palavra inválida: %s"), cliente->nome, comando);
-				_stprintf_s(msgFormatada, _countof(msgFormatada), _T("Palavra '%s' inválida! Pontos atuais: %d"), comando, cliente->pontos);
-				cliente->pontos -= PONTUACAO_PERDIDA; 
-				enviarMensagemPipe(cliente->hPipeCliente, msgFormatada);
-			}
-            break;
-	}
-	return 0;
+	return FALSE;
 }
 
 TCHAR gerarLetra() { return (TCHAR)rand() % 26 + 65; }
@@ -337,22 +311,109 @@ HANDLE CriarPipeServidorDuplex() {
     return hPipe;
 }
 
+bool checkPalavraValidaEProcessar(const TCHAR* palavra_jogador, clienteAux* aux, int* pontos_ganhos) {
+    *pontos_ganhos = 0;
+    if (palavra_jogador == NULL || aux == NULL || aux->g == NULL || aux->g->mp == NULL || pontos_ganhos == NULL) {
+        LOG_DEBUG(_T("checkPalavraValidaEProcessar: Parâmetros inválidos."));
+        return false;
+    }
+    
+    if (!palavraExisteNoDicionario(palavra_jogador)) {
+        LOG_DEBUG(_T("checkPalavraValidaEProcessar: Palavra '%s' não encontrada no dicionário."), palavra_jogador);
+        return false;
+    }
+
+    if (WaitForSingleObject(aux->g->mp->hMutex, INFINITE) != WAIT_OBJECT_0) {
+        LOG_DEBUG(_T("checkPalavraValidaEProcessar: ERRO ao aceder mutex mp para palavra '%s' de %s."), palavra_jogador, aux->nome);
+        return false;
+    }
+
+    bool palavra_valida = false; 
+
+    TCHAR palavra_jogador_maiuscula[TAMAMANHO_MAX_PALAVRA];
+    StringCchCopy(palavra_jogador_maiuscula, _countof(palavra_jogador_maiuscula), palavra_jogador);
+    _tcsupr_s(palavra_jogador_maiuscula, _countof(palavra_jogador_maiuscula));
+
+    size_t len_palavra = _tcslen(palavra_jogador_maiuscula);
+
+    if (len_palavra == 0 || len_palavra >= TAMAMANHO_MAX_PALAVRA) {
+        ReleaseMutex(aux->g->mp->hMutex);
+        LOG_DEBUG(_T("checkPalavraValidaEProcessar: Palavra '%s' tem tamanho inválido (%zu)."), palavra_jogador, len_palavra);
+        return false;
+    }
+
+    TCHAR letras_disponiveis[MAXLETRAS];
+    int indices_letras_removidas[MAXLETRAS];
+    int num_letras_usadas = 0;
+
+    for (int k = 0; k < MAXLETRAS; ++k)
+        letras_disponiveis[k] = aux->g->mp->dados->letras[k];
+    
+    for (size_t i_palavra = 0; i_palavra < len_palavra; ++i_palavra) {
+        TCHAR char_da_palavra = palavra_jogador_maiuscula[i_palavra];
+
+        for (int j_vetor = 0; j_vetor < MAXLETRAS; ++j_vetor) {
+            if (letras_disponiveis[j_vetor] == char_da_palavra &&
+                letras_disponiveis[j_vetor] != _T('\0') &&   
+                letras_disponiveis[j_vetor] != _T('\1')) {  
+                
+                indices_letras_removidas[num_letras_usadas] = j_vetor;
+
+                letras_disponiveis[j_vetor] = _T('\1'); 
+                num_letras_usadas++;
+
+                LOG_DEBUG(_T("checkPalavraValidaEProcessar: Letra '%c' da palavra '%s' ENCONTRADA no vetor (índice original %d). Total encontradas: %d"),
+                    char_da_palavra, palavra_jogador_maiuscula, j_vetor, num_letras_usadas);
+                break;
+            }
+        }
+    }
+
+    if (num_letras_usadas >= MIN_LETRAS_PARA_PONTUAR) {
+        int pontos_a_ganhar = num_letras_usadas * PONTUACAO_GANHA;
+
+        aux->pontos += pontos_a_ganhar;
+        *pontos_ganhos = pontos_a_ganhar;
+
+        TCHAR letras_removidas[MAXLETRAS + 1] = { 0 }; 
+        int current_log_idx = 0;
+
+        for (int k = 0; k < num_letras_usadas; ++k) {
+            int indice_original_para_remover = indices_letras_removidas[k];
+
+            if (aux->g->mp->dados->letras[indice_original_para_remover] != _T('\0'))
+                letras_removidas[current_log_idx++] = aux->g->mp->dados->letras[indice_original_para_remover];
+            
+            apagaLetra(aux->g->mp->dados->letras, indice_original_para_remover);
+        }
+        SetEvent(aux->g->mp->hEvento);
+
+        LOG_DEBUG(_T("checkPalavraValidaEProcessar: Palavra '%s' VÁLIDA para %s. Usou %d letras do vetor ('%s'). +%d pts. Total agora: %d"),palavra_jogador, aux->nome, num_letras_usadas, letras_removidas, pontos_a_ganhar, aux->pontos);
+        palavra_valida = true;
+    }
+    else
+        LOG_DEBUG(_T("checkPalavraValidaEProcessar: Palavra '%s' de %s encontrou apenas %d letras no vetor (mínimo %d). INVÁLIDA para pontuação."),palavra_jogador, aux->nome, num_letras_usadas, MIN_LETRAS_PARA_PONTUAR);
+    
+    ReleaseMutex(aux->g->mp->hMutex);
+    return palavra_valida;
+}
+
 // e preciso de trocar os timeouts para peek pipe, senao o readfile bloqueia
 DWORD WINAPI receberComandos(LPVOID lpParam) {
-	jogador* cliente = (jogador*)lpParam;
-	if (cliente == NULL) return 1;
-
+    clienteAux* aux = (clienteAux*)lpParam;
+	if (aux == NULL) return 1;
+    
     LOG_DEBUG(_T("Thread de recebimento de comandos iniciada para o cliente %s (ID: %d, Pipe: %p)."),
-		cliente->nome, cliente->id_jogador, cliente->hPipeCliente);
+        aux->nome, aux->id_jogador, aux->hPipeCliente);
 
-    HANDLE hPipeCliente = cliente->hPipeCliente;
+    HANDLE hPipeCliente = aux->hPipeCliente;
     BOOL clienteConectado = TRUE;
     TCHAR buffer[BUFFER_SIZE];
 
     COMMTIMEOUTS timeouts = { 0 };
-    timeouts.ReadIntervalTimeout = MAXDWORD;
-    timeouts.ReadTotalTimeoutMultiplier = 0;
-    timeouts.ReadTotalTimeoutConstant = 3000;
+    timeouts.ReadIntervalTimeout = 5000; // ms
+    timeouts.ReadTotalTimeoutMultiplier = 10; // ms
+    timeouts.ReadTotalTimeoutConstant = 500;
 
 	while (run && clienteConectado) {
 		if (!run) { clienteConectado = FALSE; continue; }
@@ -364,13 +425,66 @@ DWORD WINAPI receberComandos(LPVOID lpParam) {
             
             if (resultado && bytesLidos > 0) {
                 buffer[bytesLidos / sizeof(TCHAR)] = _T('\0');
-                LOG_DEBUG(_T("receberComandos: (Thread %lu, Pipe %p): Comando recebido do cliente '%s': %s"),GetCurrentThreadId(), hPipeCliente, cliente->nome, buffer);
-				    
-                if(gerirComandoJogador(buffer, cliente) == 1) {
-                        _tprintf(TEXT("(Thread %lu, Pipe %p): Cliente '%s' desconectou.\n"),GetCurrentThreadId(), hPipeCliente, cliente->nome);
+                LOG_DEBUG(_T("receberComandos: (Thread %lu, Pipe %p): Comando recebido do cliente '%s': %s"),GetCurrentThreadId(), hPipeCliente, aux->nome, buffer);
+                comando_jogador cmd = checkComandoJogador(buffer);
+                TCHAR msg[BUFFER_SIZE];
+
+                switch (cmd)
+                {
+                    case sair:
+                        LOG_DEBUG(_T("receberComandos: Cliente '%s' solicitou desconexão."), aux->nome);
+						enviarMensagemPipe(hPipeCliente, COMANDO_DESLIGAR_CLIENTE);
+						removerJogador(aux->g->listaJogadores, aux->id_jogador);
                         clienteConectado = FALSE;
-                        continue;
-				}
+                        break;
+                    case jogs:
+                        LOG_DEBUG(_T("receberComandos: Cliente '%s' solicitou lista de jogadores."), aux->nome);
+                        TCHAR* listaJogadores = listarJogadores(aux->g->listaJogadores);
+                        enviarMensagemPipe(hPipeCliente, listaJogadores);
+                        free(listaJogadores);
+						break;
+                    case pont:
+                        LOG_DEBUG(_T("receberComandos: Cliente '%s' solicitou sua pontuação."), aux->nome);
+                        _stprintf_s(msg, _countof(msg), _T("Sua pontuação atual: %d"), aux->pontos);
+                        enviarMensagemPipe(hPipeCliente, msg);
+						break;
+                    case palavra:
+                        LOG_DEBUG(_T("receberComandos: Cliente '%s' (ID %d) enviou uma palavra: '%s'"), aux->nome, aux->id_jogador, buffer);
+
+                        int pontos_ganhos = 0;
+                        bool palavra_foi_valida = checkPalavraValidaEProcessar(buffer, aux, &pontos_ganhos);
+
+                        if (palavra_foi_valida) {
+                            _stprintf_s(msg, _countof(msg),_T("/ok Palavra '%s' correta! +%d pontos."),buffer, pontos_ganhos);
+                            enviarMensagemPipe(hPipeCliente, msg);
+                            LOG_DEBUG(_T("receberComandos: Palavra VÁLIDA '%s' p/ %s processada. Pontos ganhos: %d. Total atual: %d"),buffer, aux->nome, pontos_ganhos, aux->pontos);
+                        }
+                        else {aux->pontos -= PONTUACAO_PERDIDA;
+                            if (aux->pontos < 0) aux->pontos = 0;
+                            _stprintf_s(msg, _countof(msg),_T("/erro PalavraInvalidaOuNaoEncontrada -%d pts."), PONTUACAO_PERDIDA);
+                            enviarMensagemPipe(hPipeCliente, msg);
+                            LOG_DEBUG(_T("receberComandos: Palavra '%s' INVÁLIDA ou ERRO p/ %s. -%d pts. Total atual: %d"),buffer, aux->nome, PONTUACAO_PERDIDA, aux->pontos);
+                        }
+
+                        // Atualizar pontuação global do jogador
+                        if (WaitForSingleObject(aux->g->listaJogadores->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
+                            for (int i = 0; i < aux->g->listaJogadores->num_jogadores; i++) {
+                                if (aux->g->listaJogadores->jogadores[i].id_jogador == aux->id_jogador) {
+                                    aux->g->listaJogadores->jogadores[i].pontos = aux->pontos; 
+                                    break;
+                                }
+                            }
+                            ReleaseMutex(aux->g->listaJogadores->g_hMutexJogadores);
+                        }
+                        else {
+                            LOG_DEBUG(_T("receberComandos: ERRO ao aceder mutex listaJogadores para atualizar pontos de %s."), aux->nome);
+                        }
+                        break;
+                    default:
+                        LOG_DEBUG(_T("receberComandos: Comando inválido recebido do cliente '%s': %s"), aux->nome, buffer);
+                        enviarMensagemPipe(hPipeCliente, _T("ComandoInvalido"));
+						break;
+                }
             } 
             else if (!resultado && 
                 (GetLastError() != ERROR_BROKEN_PIPE || 
@@ -379,30 +493,30 @@ DWORD WINAPI receberComandos(LPVOID lpParam) {
 				LOG_DEBUG(_T("receberComandos: Erro ao ler do pipe: %lu\n"), GetLastError());
                 clienteConectado = FALSE;
             }
-	}
+	} 
 
 	enviarMensagemPipe(hPipeCliente, COMANDO_DESLIGAR_CLIENTE);
 
     if (hPipeCliente != NULL && hPipeCliente != INVALID_HANDLE_VALUE) {
 		LOG_DEBUG(_T("receberComandos: (Thread %lu, Pipe %p): Desconectando cliente '%s'."),
-        GetCurrentThreadId(), hPipeCliente, cliente->nome);
+        GetCurrentThreadId(), hPipeCliente, aux->nome);
 		FlushFileBuffers(hPipeCliente);
         DisconnectNamedPipe(hPipeCliente);
         CloseHandle(hPipeCliente);
 	}
 
-	free(cliente);
+	free(aux);
 	return 0;
 }
 
 DWORD WINAPI threadGereCliente(LPVOID lpParam) {
-    memoria_partilhada* mp = (memoria_partilhada*)lpParam;
+	globais* g = (globais*)lpParam;
 	LOG_DEBUG(_T("Thread de gerenciamento de clientes iniciada."));
     
     while (run) {
 		HANDLE hPipe = INVALID_HANDLE_VALUE;
-		InterlockedExchangePointer((PVOID*) &g_hPipeServidor, NULL);
 
+		InterlockedExchangePointer((PVOID*) &g_hPipeServidor, NULL);
 		if (!run) break;
 
 		hPipe = CriarPipeServidorDuplex();
@@ -421,53 +535,61 @@ DWORD WINAPI threadGereCliente(LPVOID lpParam) {
             continue;
         }
 
-		jogador* cliente = (jogador*)malloc(sizeof(jogador));
-        if (cliente == NULL) {
-			LOG_DEBUG(_T("threadGereCliente ERRO: Falha ao alocar memória para jogador."));
-			DisconnectNamedPipe(hPipe);
+		clienteAux* aux = (clienteAux*)malloc(sizeof(clienteAux));
+        if (aux == NULL) {
+            LOG_DEBUG(_T("threadGereCliente ERRO: Falha ao alocar memória para clienteAux."));
+            DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
             continue;
-        }
-        ZeroMemory(cliente, sizeof(jogador));
-		cliente->hPipeCliente = hPipe;
+		}
+        ZeroMemory(aux, sizeof(clienteAux));
 
-		WaitForSingleObject(g_hMutexJogadores, INFINITE);
+        aux->hPipeCliente = hPipe;
+		aux->g = g;
 
-        if (g_listaJogadores.num_jogadores < MAXJOGADORES) {
-            cliente->id_jogador = g_listaJogadores.num_jogadores;
-			g_listaJogadores.jogadores[cliente->id_jogador].id_jogador = cliente->id_jogador;
+		WaitForSingleObject(g->listaJogadores->g_hMutexJogadores, INFINITE);
 
-            _stprintf_s(cliente->nome, NAME_SIZE, _T("Jogador%d"), cliente->id_jogador + 1);
-            _tcscpy_s(g_listaJogadores.jogadores[cliente->id_jogador].nome, NAME_SIZE, cliente->nome);
-			
-            g_listaJogadores.jogadores[cliente->id_jogador].pontos = 0;
-            g_listaJogadores.num_jogadores++;
-            
-            _tprintf(TEXT("\nARBITRO: Novo cliente conectado: %s (ID: %d, Pipe: %p)\n"), cliente->nome, cliente->id_jogador, hPipe);
+        if (g->listaJogadores->num_jogadores < MAXJOGADORES) {
+           
+			//criar novo jogador
+			aux->id_jogador = g->listaJogadores->prox_id_jogador;
+			_stprintf_s(aux->nome, _countof(aux->nome), _T("Jogador%d"), aux->id_jogador);
+			aux->pontos = 0;
+
+			//preencher o jogador na lista
+			g->listaJogadores->jogadores[g->listaJogadores->num_jogadores] = (jogador){
+				.id_jogador = aux->id_jogador,
+				.nome = {0},
+				.pontos = aux->pontos
+			};
+			_tcscpy_s(g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].nome, NAME_SIZE, aux->nome);
+			g->listaJogadores->num_jogadores++;
+            g->listaJogadores->prox_id_jogador++;
+
+            _tprintf(TEXT("\nARBITRO: Novo cliente conectado: %s (ID: %d, Pipe: %p)\n"), aux->nome, aux->id_jogador, hPipe);
         } else {
 			enviarMensagemPipe(hPipe, COMANDO_DESLIGAR_CLIENTE);
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
-            free(cliente);
-            ReleaseMutex(g_hMutexJogadores);
+            free(aux);
+            ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
             continue;
         }
-		ReleaseMutex(g_hMutexJogadores);
+		ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
 
-		HANDLE  hThreadCliente = CreateThread(NULL, 0, receberComandos, cliente, 0, NULL);
+		HANDLE  hThreadCliente = CreateThread(NULL, 0, receberComandos, aux, 0, NULL);
 
         if (hThreadCliente == NULL) {
 			LOG_DEBUG(_T("threadGereCliente ERRO: Falha ao criar thread para cliente (%lu)."), GetLastError());
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
-            free(cliente);
+            free(aux);
         } else
         	CloseHandle(hThreadCliente);
-    }
+	} // fim do while run
 
 	InterlockedExchangePointer((PVOID*)&g_hPipeServidor, NULL);
 	return 0;
-
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
@@ -491,39 +613,41 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     }
 }
 
-void offArbitro(memoria_partilhada *mp) {
-	if (mp->dados != NULL) UnmapViewOfFile(mp->dados);
-	if (mp->mapFile != NULL) CloseHandle(mp->mapFile);
-	if (mp->hMutex != NULL) CloseHandle(mp->hMutex);
-    if (mp->hEvento != NULL) CloseHandle(mp->hEvento);
-	if (g_hMutexJogadores != NULL) CloseHandle(g_hMutexJogadores);
-    mp->dados = NULL;
-    mp->mapFile = NULL;
-    mp->hMutex = NULL;
-	mp->hEvento = NULL;
-	g_hMutexJogadores = NULL;
+void offArbitro(globais *g) {
+	if (g->mp->dados != NULL) UnmapViewOfFile(g->mp->dados);
+	if (g->mp->mapFile != NULL) CloseHandle(g->mp->mapFile);
+	if (g->mp->hMutex != NULL) CloseHandle(g->mp->hMutex);
+    if (g->mp->hEvento != NULL) CloseHandle(g->mp->hEvento);
+	if (g->listaJogadores->g_hMutexJogadores != NULL) CloseHandle(g->listaJogadores->g_hMutexJogadores);
+    g->mp->dados = NULL;
+    g->mp->mapFile = NULL;
+    g->mp->hMutex = NULL;
+    g->mp->hEvento = NULL;
+    g->listaJogadores->g_hMutexJogadores = NULL;
+	g->mp = NULL;
 	SetConsoleCtrlHandler(CtrlHandler, FALSE); // Desregistar
 }
 
-int setup(memoria_partilhada *mp) {
+int setup(globais* g) {
 	int erro = 0;
+    LOG_DEBUG(_T("SETUP: Iniciando setup..."));
 
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE))
         _tprintf(_T("ERRO: Não foi possível definir o handler da consola no árbitro.\n"));
 
-    mp->hMutex = CreateMutex(NULL, FALSE, NOME_MUTEX);
-    if (mp->hMutex == NULL) {
+    g->mp->hMutex = CreateMutex(NULL, FALSE, NOME_MUTEX);
+    if (g->mp->hMutex == NULL) {
         _tprintf(_T("ERRO: Falha ao criar Mutex (%lu).\n"), GetLastError());
 		erro++;
     }
 
-    mp->hEvento = CreateEvent(NULL, FALSE, FALSE, NOME_EVENTO);
-    if (mp->hEvento == NULL) {
+    g->mp->hEvento = CreateEvent(NULL, FALSE, FALSE, NOME_EVENTO);
+    if (g->mp->hEvento == NULL) {
         _tprintf(_T("ERRO: Falha ao criar Evento (%lu).\n"), GetLastError());
 		erro++;
     }
 
-    mp->mapFile = CreateFileMapping(
+    g->mp->mapFile = CreateFileMapping(
         INVALID_HANDLE_VALUE,
         NULL,
         PAGE_READWRITE,
@@ -532,30 +656,28 @@ int setup(memoria_partilhada *mp) {
         NOME_MP
     );
 
-    if (mp->mapFile == NULL) {
+    if (g->mp->mapFile == NULL) {
         _tprintf(_T("ERRO: Falha ao criar FileMapping (%lu).\n"), GetLastError());
         erro++;
     }
 
-    mp->dados = (MP*)MapViewOfFile(
-        mp->mapFile,
+    g->mp->dados = (MP*)MapViewOfFile(
+        g->mp->mapFile,
         FILE_MAP_ALL_ACCESS,
         0,
         0,
         sizeof(MP)
     );
-    if (mp->dados == NULL) {
+    if (g->mp->dados == NULL) {
         _tprintf(_T("ERRO: Falha ao mapear a memória (%lu).\n"), GetLastError());
         erro++;
     }
-
-	g_hMutexJogadores = CreateMutex(NULL, FALSE, NOME_MUTEX_JOGADORES);
-    if (g_hMutexJogadores == NULL) {
+    
+    g->listaJogadores->g_hMutexJogadores = CreateMutex(NULL, FALSE, NOME_MUTEX_JOGADORES);
+    if (g->listaJogadores->g_hMutexJogadores == NULL) {
         _tprintf(_T("ERRO: Falha ao criar Mutex para jogadores (%lu).\n"), GetLastError());
         erro++;
     }
-    ZeroMemory(mp->dados, sizeof(MP));
-	ZeroMemory(&g_listaJogadores, sizeof(lista_jogadores));
 
     if (!carregarDicionario()) {
         _tprintf(_T("ERRO: Falha ao carregar o dicionário.\n"));
@@ -564,14 +686,17 @@ int setup(memoria_partilhada *mp) {
 
 	if (erro > 0) {
 		_tprintf(_T("ERRO: O árbitro não pôde ser iniciado devido a erros de configuração.\n"));
-		offArbitro(mp);
+		offArbitro(g);
 		return erro;
 	}
 
-    WaitForSingleObject(mp->hMutex, INFINITE);
-    ZeroMemory(mp->dados, sizeof(MP));
-	ZeroMemory(&g_listaJogadores, sizeof(lista_jogadores));
-    ReleaseMutex(mp->hMutex);
+	g->listaJogadores->num_jogadores = 0;
+	g->listaJogadores->prox_id_jogador = 1;
+
+    WaitForSingleObject(g->mp->hMutex, INFINITE);
+    ZeroMemory(g->mp->dados, sizeof(MP));
+	ZeroMemory(g->listaJogadores->jogadores, sizeof(g->listaJogadores->jogadores));
+    ReleaseMutex(g->mp->hMutex);
 
 	return erro;
 }
@@ -584,14 +709,19 @@ int _tmain(int argc, LPTSTR argv[]) {
 #endif
 
     srand((unsigned int)time(NULL));
-    memoria_partilhada mp = { 0 };
+	memoria_partilhada mp = { 0 };
+	lista_jogadores listaJogadores = { 0 };
+	globais globals = { 0 };
+
+	globals.mp = &mp;
+	globals.listaJogadores = &listaJogadores;
 	
 	LOG_DEBUG(_T("Iniciando o árbitro..."));
 
-	int erro = setup(&mp);
+	int erro = setup(&globals);
 	if (erro != 0) {
         _tprintf(TEXT("Falha no setup. Encerrando.\n"));
-        offArbitro(&mp);
+        offArbitro(&globals);
         _tprintf(TEXT("\nPressione Enter para sair.\n"));
         _gettchar();
         return erro;
@@ -602,14 +732,14 @@ int _tmain(int argc, LPTSTR argv[]) {
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
 	HANDLE hThreads[2];
-	hThreads[0] = CreateThread(NULL, 0, threadGeradorLetras, &mp, 0, NULL);
-	hThreads[1] = CreateThread(NULL, 0, threadGereCliente, &mp, 0, NULL);
+	hThreads[0] = CreateThread(NULL, 0, threadGeradorLetras, globals.mp, 0, NULL);
+	hThreads[1] = CreateThread(NULL, 0, threadGereCliente, &globals, 0, NULL);
 
 	if (hThreads[0] == NULL || hThreads[1] == NULL) {
 		_tprintf(_T("ERRO: Falha ao criar threads (%lu).\n"), GetLastError());
 		if (hThreads[0] != NULL) CloseHandle(hThreads[0]);
 		if (hThreads[1] != NULL) CloseHandle(hThreads[1]);
-		offArbitro(&mp);
+		offArbitro(&globals);
 		return 1;
 	}
 
@@ -617,6 +747,6 @@ int _tmain(int argc, LPTSTR argv[]) {
 	CloseHandle(hThreads[0]);
 	CloseHandle(hThreads[1]);
 
-	offArbitro(&mp);
+    offArbitro(&globals);
     return 0;
 }
