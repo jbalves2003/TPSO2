@@ -17,6 +17,7 @@
 #define LOG_DEBUG(FORMAT, ...)
 #endif
 
+#define NOME_EXECUTAVEL_BOT _T("bot.exe")
 #define MOME_FICHEIRO_DICIONARIO _T("dicionario.txt")
 #define MAX_PALAVRAS 1000
 #define TAMAMANHO_MAX_PALAVRA 30
@@ -838,6 +839,47 @@ DWORD WINAPI threadAdminConsole(LPVOID lpParam) {
             escreverOutput(g, _T("%s"), output_buffer);
             break;
         } // Fim do case excluir
+        case iniciarbot: {
+            if (argumentoCmd != NULL && _tcslen(argumentoCmd) > 0) {
+                // argumentoCmd é o nome do bot (ex: "RoboEsperto")
+                TCHAR nomeDoBot[NAME_SIZE];
+                StringCchCopy(nomeDoBot, _countof(nomeDoBot), argumentoCmd);
+
+                TCHAR linhaDeComandoBot[BUFFER_SIZE];
+                StringCchPrintf(linhaDeComandoBot, _countof(linhaDeComandoBot),_T("%s %s %s"), NOME_EXECUTAVEL_BOT, PIPE_NAME, nomeDoBot);
+
+                STARTUPINFO si;
+                PROCESS_INFORMATION pi;
+
+                ZeroMemory(&si, sizeof(si));
+                si.cb = sizeof(si);
+                ZeroMemory(&pi, sizeof(pi));
+
+                escreverOutput(g, _T("Admin: Tentando iniciar bot '%s' com comando: %s"), nomeDoBot, linhaDeComandoBot);
+
+                if (CreateProcess(NULL,         // Nome do módulo (usa linha de comando)
+                    linhaDeComandoBot,          // Linha de comando
+                    NULL,                       // Atributos de segurança do processo
+                    NULL,                       // Atributos de segurança da thread
+                    FALSE,                      // Herança de handles (FALSE=não herda)
+                    0,                          // Flags de criação (ex: CREATE_NEW_CONSOLE para nova janela)
+                    NULL,                       // Ambiente (usa o do pai)
+                    NULL,                       // Diretório atual (usa o do pai)
+                    &si,                        // Ponteiro para STARTUPINFO
+                    &pi)                        // Ponteiro para PROCESS_INFORMATION
+                    ) {
+                    escreverOutput(g, _T("Admin: Bot '%s' iniciado com sucesso. PID: %lu, Thread ID: %lu"), nomeDoBot, pi.dwProcessId, pi.dwThreadId);
+
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                }
+                else 
+                    escreverOutput(g, _T("Admin: ERRO ao iniciar bot '%s'. Código de erro: %lu"), nomeDoBot, GetLastError());
+            }
+            else 
+                escreverOutput(g, _T("Uso: /iniciarbot <nome_do_bot>"));
+            break;
+        }
         case encerrar:
             escreverOutput(g, _T("Comando /encerrar recebido. Servidor a desligar..."));
             run = false;
