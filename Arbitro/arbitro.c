@@ -17,10 +17,18 @@
 #define LOG_DEBUG(FORMAT, ...)
 #endif
 
+#define MOME_FICHEIRO_DICIONARIO _T("dicionario.txt")
+#define MAX_PALAVRAS 1000
+#define TAMAMANHO_MAX_PALAVRA 30
+TCHAR g_Dicionario[MAX_PALAVRAS][TAMAMANHO_MAX_PALAVRA];
+int g_NumeroDePalavrasNoDicionario = 0;
+
 #define PIPE_NAME _T("\\\\.\\pipe\\pipe")
 #define BUFFER_SIZE 512
 
 #define RITMO 3 * 1000
+#define PONTUACAO_GANHA 10 // Pontuação por palavra correta
+#define PONTUACAO_PERDIDA 5 // Pontuação perdida por palavra errada
 
 #define NAME_SIZE 20
 #define MAXJOGADORES 20
@@ -58,7 +66,8 @@ typedef enum {
     invalido_jogador = -1,
     sair,
     jogs,
-    pont
+    pont,
+    palavra
 } comando_jogador;
 
 // talvez adicionar defines para todos os comandos
@@ -68,7 +77,8 @@ comando_jogador checkComandoJogador(const TCHAR* comando) {
 	if (_tcsicmp(comando, COMANDO_DESLIGAR_CLIENTE) == 0) return sair;
     if (_tcsicmp(comando, _T("/jogs")) == 0) return jogs;
     if (_tcsicmp(comando, _T("/pont")) == 0) return pont;
-	return invalido_jogador;
+	//if (_tcsicmp(comando[0], _T("/")) == 0) return invalido_jogador;
+	return palavra;
 }
 
 typedef enum {
@@ -92,6 +102,54 @@ comando_admin checkComandoAdmin(const TCHAR* comando) {
     if (_tcsicmp(comando, _T("/encerrar")) == 0) return encerrar;
 
     return invalido_admin;
+}
+
+BOOL carregarDicionario() {
+    FILE* fp = NULL;
+    errno_t err = _tfopen_s(&fp, MOME_FICHEIRO_DICIONARIO, _T("r, ccs=UTF-8"));
+
+    if (err != 0 || fp == NULL) {
+        _tprintf(TEXT("ARBITRO ERRO: Nao foi possivel abrir o ficheiro do dicionario '%s'. errno: %d\n"), MOME_FICHEIRO_DICIONARIO, err);
+        perror("Detalhe do erro de _tfopen_s");
+        return FALSE;
+    }
+
+    _tprintf(TEXT("ARBITRO: Carregando dicionario de '%s'...\n"), MOME_FICHEIRO_DICIONARIO);
+    g_NumeroDePalavrasNoDicionario = 0;
+    TCHAR linhaBuffer[TAMAMANHO_MAX_PALAVRA + 2];
+
+    while (g_NumeroDePalavrasNoDicionario < MAX_PALAVRAS &&
+        _fgetts(linhaBuffer, _countof(linhaBuffer), fp) != NULL)
+    {
+        linhaBuffer[_tcscspn(linhaBuffer, _T("\r\n"))] = _T('\0');
+
+        if (_tcslen(linhaBuffer) > 0 && _tcslen(linhaBuffer) < TAMAMANHO_MAX_PALAVRA) { // Ignorar linhas vazias e muito longas
+            _tcscpy_s(g_Dicionario[g_NumeroDePalavrasNoDicionario], TAMAMANHO_MAX_PALAVRA, linhaBuffer);
+            g_NumeroDePalavrasNoDicionario++;
+        }
+    }
+
+    fclose(fp);
+    _tprintf(TEXT("ARBITRO: Dicionario carregado com %d palavras.\n"), g_NumeroDePalavrasNoDicionario);
+
+    if (g_NumeroDePalavrasNoDicionario == 0) {
+        _tprintf(TEXT("ARBITRO AVISO: Nenhuma palavra carregada do dicionario. O ficheiro pode estar vazio ou mal formatado.\n"));
+        // Decidir se isto é um erro 
+    }
+    return TRUE;
+}
+
+BOOL palavraExisteNoDicionario(const TCHAR* palavra) {
+    if (palavra == NULL || g_NumeroDePalavrasNoDicionario == 0) return FALSE;
+
+    TCHAR palavraFormatada[TAMAMANHO_MAX_PALAVRA];
+    _tcscpy_s(palavraFormatada, _countof(palavraFormatada), palavra);
+    
+    for (int i = 0; i < g_NumeroDePalavrasNoDicionario; ++i)
+        if (_tcsicmp(palavraFormatada, g_Dicionario[i]) == 0)
+            return TRUE;
+    
+    return FALSE;
 }
 
 void enviarMensagemPipe(HANDLE hPipe, const TCHAR* mensagem) {
@@ -156,9 +214,10 @@ BOOL removerJogador(int id_jogador) {
 	return TRUE;
 }
 
-int gerirComandoJogador(TCHAR* comando, jogador* cliente) {
+int gerirComandoJogador(const TCHAR* comando, jogador* cliente) {
     if (comando == NULL || cliente == NULL) return;
     comando_jogador cmd = checkComandoJogador(comando);
+    TCHAR msgFormatada[BUFFER_SIZE];
     switch (cmd) {
         case sair:
 			if (!removerJogador(cliente->id_jogador))
@@ -176,12 +235,25 @@ int gerirComandoJogador(TCHAR* comando, jogador* cliente) {
             break;
         case pont:
 			LOG_DEBUG(_T("Jogador %s solicitou sua pontuação."), cliente->nome);
-            TCHAR msgPontos[BUFFER_SIZE];
-            _stprintf_s(msgPontos, _countof(msgPontos), _T("Sua pontuacao atual: %d"), cliente->pontos);
-            enviarMensagemPipe(cliente->hPipeCliente, msgPontos);
+            _stprintf_s(msgFormatada, _countof(msgFormatada), _T("Sua pontuacao atual: %d"), cliente->pontos);
+            enviarMensagemPipe(cliente->hPipeCliente, msgFormatada);
             break;
+		case invalido_jogador:
+			LOG_DEBUG(_T("Comando inválido recebido do jogador %s: %s"), cliente->nome, comando);
+            enviarMensagemPipe(cliente->hPipeCliente, _T("/erro ComandoInvalido"));
+			break;
         default:
-			enviarMensagemPipe(cliente->hPipeCliente, _T("/erro ComandoInvalido"));
+            if (palavraExisteNoDicionario(comando)) {
+                LOG_DEBUG(_T("Jogador %s digitou a palavra válida: %s"), cliente->nome, comando);
+                cliente->pontos += PONTUACAO_GANHA;
+                _stprintf_s(msgFormatada, _countof(msgFormatada), _T("Palavra '%s' aceita! Pontos atuais: %d"), comando, cliente->pontos);
+                enviarMensagemPipe(cliente->hPipeCliente, msgFormatada);
+            } else {
+                LOG_DEBUG(_T("Jogador %s digitou a palavra inválida: %s"), cliente->nome, comando);
+				_stprintf_s(msgFormatada, _countof(msgFormatada), _T("Palavra '%s' inválida! Pontos atuais: %d"), comando, cliente->pontos);
+				cliente->pontos -= PONTUACAO_PERDIDA; 
+				enviarMensagemPipe(cliente->hPipeCliente, msgFormatada);
+			}
             break;
 	}
 	return 0;
@@ -485,7 +557,13 @@ int setup(memoria_partilhada *mp) {
     ZeroMemory(mp->dados, sizeof(MP));
 	ZeroMemory(&g_listaJogadores, sizeof(lista_jogadores));
 
+    if (!carregarDicionario()) {
+        _tprintf(_T("ERRO: Falha ao carregar o dicionário.\n"));
+        erro++;
+	}
+
 	if (erro > 0) {
+		_tprintf(_T("ERRO: O árbitro não pôde ser iniciado devido a erros de configuração.\n"));
 		offArbitro(mp);
 		return erro;
 	}
