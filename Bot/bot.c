@@ -87,13 +87,14 @@ BOOL carregarDicionarioBot() {
     FILE* fp = NULL;
     errno_t err = _tfopen_s(&fp, NOME_FICHEIRO_DICIONARIO, _T("r, ccs=UTF-8"));
 
+	LOG_DEBUG(_T("Tentando abrir dicionario '%s'."), NOME_FICHEIRO_DICIONARIO);
+
     if (err != 0 || fp == NULL) {
         _tprintf(TEXT("[BOT_ERRO]: Nao foi possivel abrir o ficheiro do dicionario '%s'. errno: %d\n"), NOME_FICHEIRO_DICIONARIO, err);
         LOG_DEBUG(_T("Erro ao abrir dicionario. Verifique se o ficheiro '%s' existe e tem permissao de leitura."), NOME_FICHEIRO_DICIONARIO);
         return FALSE;
     }
 
-    _tprintf(TEXT("[BOT_INFO]: Carregando dicionario de '%s'...\n"), NOME_FICHEIRO_DICIONARIO);
     g_NumeroDePalavrasNoDicionario = 0;
     TCHAR linhaBuffer[TAMANHO_MAX_PALAVRA_DICIONARIO + 2];
 
@@ -113,7 +114,7 @@ BOOL carregarDicionarioBot() {
     }
 
     fclose(fp);
-    _tprintf(TEXT("[BOT_INFO]: Dicionario carregado com %d palavras.\n"), g_NumeroDePalavrasNoDicionario);
+	LOG_DEBUG(_T("Dicionario carregado com %d palavras."), g_NumeroDePalavrasNoDicionario);
 
     if (g_NumeroDePalavrasNoDicionario == 0) {
         _tprintf(TEXT("[BOT_AVISO]: Nenhuma palavra carregada do dicionario. O ficheiro pode estar vazio ou mal formatado.\n"));
@@ -460,16 +461,14 @@ int setup_bot(bot_globals* bg, int argc, TCHAR* argv[]) {
 
     if (argc > 2 && argv[2] != NULL && _tcslen(argv[2]) > 0) {
         StringCchCopy(bg->bot_name, _countof(bg->bot_name), argv[2]);
-        _tprintf(_T("[BOT_INFO] Iniciando com nome fornecido pelo admin: %s\n"), bg->bot_name);
+		LOG_DEBUG(_T("[BOT_INFO] Nome do bot fornecido: %s"), bg->bot_name);
     }
     else {
         _stprintf_s(bg->bot_name, _countof(bg->bot_name), _T("%s%d"), BOT_NAME_PREFIX_DEFAULT, rand() % 1000);
-        _tprintf(_T("[BOT_INFO] Nome não fornecido, usando gerado: %s\n"), bg->bot_name);
+		LOG_DEBUG(_T("[BOT_INFO] Nome do bot não fornecido, usando padrão: %s"), bg->bot_name);
     }
 
     bg->reaction_time_ms = MIN_REACTION_MS + (rand() % (MAX_REACTION_MS - MIN_REACTION_MS + 1));
-    _tprintf(_T("[BOT_INFO:%s] (Reação: %dms)\n"), bg->bot_name, bg->reaction_time_ms);
-
     if (!carregarDicionarioBot()) {
         _tprintf(_T("[BOT_ERRO_FATAL:%s]: Falha ao carregar o dicionário.\n"), bg->bot_name);
         return 1;
@@ -488,7 +487,6 @@ int setup_bot(bot_globals* bg, int argc, TCHAR* argv[]) {
     }
     else {
         bg->hMutex_mp = NULL;
-        _tprintf(_T("[BOT_INFO:%s] Não tentando abrir Mutex MP (NOME_MUTEX vazio ou NULL).\n"), bg->bot_name);
     }
 
     bg->hEvento_mp = OpenEvent(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, NOME_EVENTO);
@@ -528,9 +526,6 @@ int setup_bot(bot_globals* bg, int argc, TCHAR* argv[]) {
     return 0;
 }
 
-
-// Wrapper para atexit, pois atexit espera void func(void)
-// A definição completa deve estar aqui, antes de ser usada em _tmain.
 void cleanup_bot_wrapper(void) {
     if (g_bot_globals_for_atexit != NULL) {
         const TCHAR* botNameForLog = (_tcslen(g_bot_globals_for_atexit->bot_name) > 0) ?
@@ -558,8 +553,6 @@ int _tmain(int argc, TCHAR* argv[]) {
         _tprintf(_T("[BOT_AVISO] Falha ao registrar a função atexit para limpeza.\n"));
     }
 
-    _tprintf(_T("[BOT_MAIN] Iniciando...\n"));
-
     if (argc < 3) {
         _tprintf(_T("Uso: %s <NomeDoPipeServidor> <NomeDoBot>\n"), (argc > 0 ? argv[0] : _T("bot.exe")));
         _tprintf(_T("Exemplo: %s \\\\.\\pipe\\pipe BotAmigo\n"), (argc > 0 ? argv[0] : _T("bot.exe")));
@@ -573,9 +566,6 @@ int _tmain(int argc, TCHAR* argv[]) {
         if (_gettchar() == EOF) {};
         return 1;
     }
-
-    // APÓS setup_bot ser bem-sucedido (pipe conectado, nome do bot definido em bg_local_main.bot_name):
-    _tprintf(_T("[BOT_MAIN:%s] Setup completo. Tentando login no servidor...\n"), bg_local_main.bot_name);
 
     TCHAR loginCmd[BUFFER_SIZE];
     // Usar StringCchPrintf para segurança
@@ -591,46 +581,24 @@ int _tmain(int argc, TCHAR* argv[]) {
         _tprintf(_T("[BOT_ERRO:%s] Falha ao enviar comando de login para o servidor. Encerrando.\n"), bg_local_main.bot_name);
         return 1;
     }
-    _tprintf(_T("[BOT_MAIN:%s] Comando de login enviado: '%s'. Aguardando resposta...\n"), bg_local_main.bot_name, loginCmd);
 
     // Esperar pela resposta do login do servidor
     TCHAR respostaLogin[BUFFER_SIZE];
     DWORD bytesLidosLogin;
 
-    // Configurar timeouts para a leitura da resposta do login
-    COMMTIMEOUTS timeoutsLogin = { 0 };
-    timeoutsLogin.ReadIntervalTimeout = 0; // Não usar timeouts de intervalo para ReadFile síncrono simples
-    timeoutsLogin.ReadTotalTimeoutMultiplier = 0;
-    timeoutsLogin.ReadTotalTimeoutConstant = 10000; // Esperar até 10 segundos pela resposta do login
-
-    if (!SetCommTimeouts(bg_local_main.hPipe, &timeoutsLogin)) {
-        _tprintf(_T("[BOT_ERRO:%s] Falha ao definir timeouts para resposta de login. Erro: %lu. Encerrando.\n"), bg_local_main.bot_name, GetLastError());
-        return 1;
-    }
-
     ZeroMemory(respostaLogin, sizeof(respostaLogin));
     if (ReadFile(bg_local_main.hPipe, respostaLogin, (sizeof(respostaLogin) / sizeof(TCHAR) - 1) * sizeof(TCHAR), &bytesLidosLogin, NULL) && bytesLidosLogin > 0) {
         respostaLogin[bytesLidosLogin / sizeof(TCHAR)] = _T('\0');
-        _tprintf(_T("[BOT_MAIN:%s] Resposta do login do servidor: '%s'\n"), bg_local_main.bot_name, respostaLogin);
 
         if (_tcsicmp(respostaLogin, _T("/login_ok")) != 0) {
             _tprintf(_T("[BOT_ERRO:%s] Login falhou ou foi rejeitado pelo servidor. Motivo: '%s'. Encerrando.\n"), bg_local_main.bot_name, respostaLogin);
             return 1;
         }
-        _tprintf(_T("[BOT_MAIN:%s] Login bem-sucedido no servidor!\n"), bg_local_main.bot_name);
     }
     else {
         _tprintf(_T("[BOT_ERRO:%s] Falha ao receber resposta de login do servidor ou pipe fechado. Erro: %lu. Encerrando.\n"), bg_local_main.bot_name, GetLastError());
         return 1;
     }
-
-    // Após o login bem-sucedido, pode ser necessário restaurar os timeouts do pipe se 
-    // a threadReceberComandosServidor usar ReadFile com timeouts diferentes ou se
-    // PeekNamedPipe não for o suficiente e timeouts no handle forem desejados para ela.
-    // No seu caso, threadReceberComandosServidor usa PeekNamedPipe, então não precisa mexer nos timeouts aqui.
-
-
-    _tprintf(_T("[BOT_MAIN:%s] Iniciando threads de comportamento do bot...\n"), bg_local_main.bot_name);
 
     HANDLE hThreads[2];
     hThreads[0] = CreateThread(NULL, 0, threadReceberComandosServidor, &bg_local_main, 0, NULL);
@@ -644,8 +612,6 @@ int _tmain(int argc, TCHAR* argv[]) {
         if (hThreads[1]) { WaitForSingleObject(hThreads[1], 2000); CloseHandle(hThreads[1]); }
     }
     else {
-        _tprintf(_T("[BOT_MAIN:%s] está a correr... (Pressione Ctrl+C para sair)\n"), bg_local_main.bot_name);
-
         while (g_run_bot) {
             // ... (lógica de monitoramento das threads como antes) ...
             DWORD exitCodeCmd = STILL_ACTIVE, exitCodeAdv = STILL_ACTIVE;
