@@ -323,7 +323,9 @@ DWORD WINAPI receberComandosPipe(LPVOID lpParam) {
                 buffer[bytesRead / sizeof(TCHAR)] = _T('\0');
                 
                 if (hMutexConsole && WaitForSingleObject(hMutexConsole, INFINITE) == WAIT_OBJECT_0) {
-                    limparLinha(LINHA_MENSAGENS_SERVIDOR, g->hStdout);
+                    for (SHORT i = 0; i < 50; ++i)
+                        limparLinha(LINHA_MENSAGENS_SERVIDOR + i, g->hStdout);
+
                     moverCursor(0, LINHA_MENSAGENS_SERVIDOR, g->hStdout);
                     _tprintf(_T("Servidor: %s"), buffer);
                     fflush(stdout);

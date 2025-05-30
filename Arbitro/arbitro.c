@@ -36,7 +36,7 @@ int ritmo = 5 * TEMPO;
 #define MIN_LETRAS_PARA_PONTUAR 2 // Mínimo de letras usadas para pontuar
 
 #define NAME_SIZE 20
-#define MAXJOGADORES 2
+#define MAXJOGADORES 20
 #define NOME_MUTEX_JOGADORES NULL // Mutex para proteger acesso à lista de jogadores
 
 #define COMANDO_DESLIGAR_CLIENTE _T("/sair")
@@ -213,25 +213,52 @@ void enviarMensagemPipe(HANDLE hPipe, const TCHAR* mensagem) {
 
 TCHAR* listarJogadores(lista_jogadores* lista) {
     TCHAR* buffer = (TCHAR*)malloc(BUFFER_SIZE * sizeof(TCHAR));
-    if (buffer == NULL) return NULL;
-	ZeroMemory(buffer, BUFFER_SIZE * sizeof(TCHAR));
+    if (buffer == NULL) return NULL; 
+    buffer[0] = _T('\0');
+
+    TCHAR* pBuffer = buffer;
+
+    if (lista == NULL || lista->g_hMutexJogadores == NULL) {
+        _tcscpy_s(buffer, BUFFER_SIZE, _T("Erro: Lista de jogadores inválida.\n"));
+        return buffer;
+    }
 
     if (WaitForSingleObject(lista->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
-        if (lista->num_jogadores == 0) {
-            StringCchCopy(buffer, BUFFER_SIZE, _T("Nenhum jogador conectado.\n"));
-        }
+        if (lista->num_jogadores == 0)
+            _tcscpy_s(pBuffer, BUFFER_SIZE - (pBuffer - buffer), _T("Nenhum jogador conectado.\n"));
         else {
-            StringCchCopy(buffer, BUFFER_SIZE, _T("Jogadores conectados:\n"));
+            int charsEscritos = _stprintf_s(pBuffer, BUFFER_SIZE - (pBuffer - buffer),
+                _T("Jogadores (ID Nome : Pontos):\n"));
+            if (charsEscritos > 0) pBuffer += charsEscritos;
+
             for (int i = 0; i < lista->num_jogadores; i++) {
-                StringCchCat(buffer, BUFFER_SIZE, lista->jogadores[i].nome);
-                StringCchCat(buffer, BUFFER_SIZE, _T("\n"));
+                size_t espacoRestante = BUFFER_SIZE - (pBuffer - buffer);
+                if (espacoRestante < (NAME_SIZE + 20)) {
+                    if (espacoRestante > 25) _tcscat_s(pBuffer, espacoRestante, _T("...lista truncada...\n"));
+                    break;
+                }
+
+                charsEscritos = _stprintf_s(
+                    pBuffer,
+                    espacoRestante,
+                    _T("%-5d %-*s : %8d\n"),
+                    lista->jogadores[i].id_jogador,
+                    NAME_SIZE,
+                    lista->jogadores[i].nome,
+                    lista->jogadores[i].pontos
+                );
+
+                if (charsEscritos > 0)
+                    pBuffer += charsEscritos;
+                else
+                    break;
             }
         }
         ReleaseMutex(lista->g_hMutexJogadores);
     }
     else
-        LOG_DEBUG(_T("listarJogadores: ERRO ao aceder lista.\n"));
-	
+        _tcscpy_s(buffer, BUFFER_SIZE, _T("Erro ao aceder lista de jogadores.\n"));
+
     return buffer;
 }
 
@@ -650,8 +677,8 @@ DWORD WINAPI receberComandos(LPVOID lpParam) {
                                 enviarMensagemPipe(hPipeCliente, msg);
 							    escreverOutput(aux->g, _T("Palavra '%s' correta para %s! +%d pts. Total atual: %d"), buffer, aux->nome, pontos_ganhos, aux->pontos);
                             }
-                            else {aux->pontos -= PONTUACAO_PERDIDA;
-                                if (aux->pontos < 0) aux->pontos = 0;
+                            else {
+                                aux->pontos -= PONTUACAO_PERDIDA;
                                 _stprintf_s(msg, _countof(msg),_T("/erro PalavraInvalidaOuNaoEncontrada -%d pts."), PONTUACAO_PERDIDA);
                                 enviarMensagemPipe(hPipeCliente, msg);
                                 LOG_DEBUG(_T("receberComandos: Palavra '%s' INVÁLIDA ou ERRO p/ %s. -%d pts. Total atual: %d"),buffer, aux->nome, PONTUACAO_PERDIDA, aux->pontos);
@@ -1072,7 +1099,6 @@ int setup(globais* g) {
 }
 
 int _tmain(int argc, LPTSTR argv[]) {
-
 #ifdef UNICODE
     _setmode(_fileno(stdout), _O_WTEXT);
     _setmode(_fileno(stdin), _O_WTEXT);
