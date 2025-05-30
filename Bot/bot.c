@@ -1,3 +1,4 @@
+// bot.c
 #include <windows.h>
 #include <tchar.h>
 #include <stdio.h>
@@ -6,45 +7,48 @@
 #include <stdbool.h>
 #include <io.h>
 #include <fcntl.h>
-#include <string.h>
-#include "mp.h"
+#include <string.h> 
+#include <strsafe.h>
+#include "mp.h"  
 
-
-//#define DEBUG_MODE
+//-------------------------------------------------------------------
+// DEFINES GERAIS E DE DEBUG
+//-------------------------------------------------------------------
+//#define DEBUG_MODE 
 #ifdef DEBUG_MODE
 #define LOG_DEBUG(format, ...) _tprintf(_T("[BOT_DEBUG] :%s:%d: " format _T("\n")), _T(__FILE__), __LINE__, ##__VA_ARGS__)
 #else
 #define LOG_DEBUG(FORMAT, ...)
 #endif
 
-#define PIPE_NAME _T("\\\\.\\pipe\\pipe")
 #define BUFFER_SIZE 512
-#define BOT_NAME_PREFIX _T("BotPlayer")
+#define BOT_NAME_PREFIX_DEFAULT _T("BotPlayer") 
+#define COMANDO_DESLIGAR_CLIENTE _T("/sair") 
 
-#define COMANDO_DESLIGAR_CLIENTE _T("/sair")
-
-// --- Definições e Funções do Dicionário ---
+//-------------------------------------------------------------------
+// DEFINES DO DICIONÁRIO
+//-------------------------------------------------------------------
 #define NOME_FICHEIRO_DICIONARIO _T("dicionario.txt")
-#define MAX_PALAVRAS_DICIONARIO 50000
+#define MAX_PALAVRAS_DICIONARIO 1000 
 #define TAMANHO_MAX_PALAVRA_DICIONARIO 30
 
-TCHAR g_Dicionario[MAX_PALAVRAS_DICIONARIO][TAMANHO_MAX_PALAVRA_DICIONARIO];
-int g_NumeroDePalavrasNoDicionario = 0;
-
-// Parâmetros de comportamento do Bot
+//-------------------------------------------------------------------
+// DEFINES DE COMPORTAMENTO DO BOT
+//-------------------------------------------------------------------
 #define MIN_REACTION_MS 3000
 #define MAX_REACTION_MS 7000
 #define CHANCE_TO_SUBMIT_WORD 90 
-
-
-#define CHANCE_BOT_TENTAR_PALAVRA_ERRADA 70 
+#define CHANCE_BOT_TENTAR_PALAVRA_ERRADA 30 
 #define CHANCE_BOT_DIGITAR_ERRADO 10    
 #define MIN_LEN_PALAVRA_ERRADA 3
-#define MAX_LEN_PALAVRA_ERRADA 7
+#define MAX_LEN_PALAVRA_ERRADA 10 
 
-
+//-------------------------------------------------------------------
+// VARIÁVEIS GLOBAIS
+//-------------------------------------------------------------------
 volatile bool g_run_bot = TRUE;
 
+// 1. DEFINIÇÃO DA STRUCT bot_globals
 typedef struct {
     MP* dados_mp;
     HANDLE hMutex_mp;
@@ -55,7 +59,31 @@ typedef struct {
     int reaction_time_ms;
 } bot_globals;
 
-BOOL carregarDicionario() {
+// 2. PONTEIRO GLOBAL PARA USO COM ATEXIT
+bot_globals* g_bot_globals_for_atexit = NULL;
+
+// 3. GLOBAIS DO DICIONÁRIO
+TCHAR g_Dicionario[MAX_PALAVRAS_DICIONARIO][TAMANHO_MAX_PALAVRA_DICIONARIO];
+int g_NumeroDePalavrasNoDicionario = 0;
+
+//-------------------------------------------------------------------
+// PROTÓTIPOS DE FUNÇÕES
+//-------------------------------------------------------------------
+BOOL carregarDicionarioBot();
+void cleanup_bot(bot_globals* bg);
+void cleanup_bot_wrapper(void);
+BOOL WINAPI CtrlHandler_Bot(DWORD fdwCtrlType);
+BOOL enviarMensagemPipeBot(HANDLE hPipe, const TCHAR* mensagem);
+DWORD WINAPI threadReceberComandosServidor(LPVOID lpParam);
+bool can_form_word_with_letters(const TCHAR* word_candidate_uppercase, const TCHAR* available_letters_from_mp_uppercase);
+DWORD WINAPI threadAdivinharPalavraComDicionario(LPVOID lpParam);
+int setup_bot(bot_globals* bg, int argc, TCHAR* argv[]);
+
+//-------------------------------------------------------------------
+// IMPLEMENTAÇÃO DAS FUNÇÕES
+//-------------------------------------------------------------------
+
+BOOL carregarDicionarioBot() {
     FILE* fp = NULL;
     errno_t err = _tfopen_s(&fp, NOME_FICHEIRO_DICIONARIO, _T("r, ccs=UTF-8"));
 
@@ -72,7 +100,7 @@ BOOL carregarDicionario() {
     while (g_NumeroDePalavrasNoDicionario < MAX_PALAVRAS_DICIONARIO &&
         _fgetts(linhaBuffer, _countof(linhaBuffer), fp) != NULL)
     {
-        linhaBuffer[_tcscspn(linhaBuffer, _T("\r\n"))] = _T('\0'); // Remove newline
+        linhaBuffer[_tcscspn(linhaBuffer, _T("\r\n"))] = _T('\0');
         size_t lenPalavra = _tcslen(linhaBuffer);
 
         if (lenPalavra > 0 && lenPalavra < TAMANHO_MAX_PALAVRA_DICIONARIO && lenPalavra <= MAXLETRAS) {
@@ -94,19 +122,34 @@ BOOL carregarDicionario() {
 }
 
 void cleanup_bot(bot_globals* bg) {
-    if (bg->dados_mp != NULL) UnmapViewOfFile(bg->dados_mp);
-    bg->dados_mp = NULL;
-    if (bg->hMapFile_mp != NULL) CloseHandle(bg->hMapFile_mp);
-    bg->hMapFile_mp = NULL;
-    if (bg->hMutex_mp != NULL) CloseHandle(bg->hMutex_mp);
-    bg->hMutex_mp = NULL;
-    if (bg->hEvento_mp != NULL) CloseHandle(bg->hEvento_mp);
-    bg->hEvento_mp = NULL;
-    if (bg->hPipe != NULL && bg->hPipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(bg->hPipe);
+    // Verifica se bg e bg->bot_name são válidos antes de usar em _tprintf
+    const TCHAR* botNameForLog = (bg != NULL && _tcslen(bg->bot_name) > 0) ? bg->bot_name : _T("NomeIndefinido");
+    LOG_DEBUG(_T("Bot '%s': Iniciando limpeza..."), botNameForLog);
+
+    if (bg == NULL) return; // Não há nada para limpar se bg for NULL
+
+    if (bg->dados_mp != NULL) {
+        UnmapViewOfFile(bg->dados_mp);
+        bg->dados_mp = NULL;
     }
-    bg->hPipe = NULL;
-    LOG_DEBUG(_T("Recursos do bot limpos."));
+    if (bg->hMapFile_mp != NULL) {
+        CloseHandle(bg->hMapFile_mp);
+        bg->hMapFile_mp = NULL;
+    }
+    if (bg->hMutex_mp != NULL) {
+        CloseHandle(bg->hMutex_mp);
+        bg->hMutex_mp = NULL;
+    }
+    if (bg->hEvento_mp != NULL) {
+        CloseHandle(bg->hEvento_mp);
+        bg->hEvento_mp = NULL;
+    }
+    if (bg->hPipe != NULL && bg->hPipe != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(bg->hPipe);
+        CloseHandle(bg->hPipe);
+        bg->hPipe = INVALID_HANDLE_VALUE;
+    }
+    _tprintf(_T("[BOT_INFO:%s] Recursos limpos.\n"), botNameForLog);
 }
 
 BOOL WINAPI CtrlHandler_Bot(DWORD fdwCtrlType) {
@@ -115,10 +158,10 @@ BOOL WINAPI CtrlHandler_Bot(DWORD fdwCtrlType) {
     case CTRL_CLOSE_EVENT:
     case CTRL_BREAK_EVENT:
         if (g_run_bot) {
-            _tprintf(_T("\n[BOT:%s] Sinal de terminação (Ctrl-C/Close) recebido. A desligar...\n"), _T("NomeBot")); // Idealmente usar bg->bot_name se acessível
+            _tprintf(_T("\n[BOT] Sinal de terminação (Ctrl-C/Close) recebido. A desligar...\n"));
         }
         g_run_bot = FALSE;
-        Sleep(200);
+        Sleep(300);
         return TRUE;
     default:
         return FALSE;
@@ -132,7 +175,6 @@ BOOL enviarMensagemPipeBot(HANDLE hPipe, const TCHAR* mensagem) {
     }
     DWORD bytesEscritos;
     DWORD lenBytes = (DWORD)(_tcslen(mensagem) + 1) * sizeof(TCHAR);
-
     BOOL resultado = WriteFile(hPipe, mensagem, lenBytes, &bytesEscritos, NULL);
 
     if (!resultado) {
@@ -140,9 +182,10 @@ BOOL enviarMensagemPipeBot(HANDLE hPipe, const TCHAR* mensagem) {
     }
     else if (bytesEscritos != lenBytes) {
         LOG_DEBUG(_T("Aviso: Nem todos os bytes foram escritos para '%s'. Esperado: %lu, Escrito: %lu"), mensagem, lenBytes, bytesEscritos);
-        return FALSE;
     }
-    LOG_DEBUG(_T("Mensagem '%s' enviada com sucesso."), mensagem);
+    else {
+        LOG_DEBUG(_T("Mensagem '%s' enviada com sucesso."), mensagem);
+    }
     return resultado;
 }
 
@@ -151,82 +194,92 @@ DWORD WINAPI threadReceberComandosServidor(LPVOID lpParam) {
     TCHAR buffer[BUFFER_SIZE];
     LOG_DEBUG(_T("Thread de escuta do servidor para o bot '%s' iniciada."), bg->bot_name);
 
-    while (g_run_bot) {
-        DWORD bytesLidos = 0;
-        COMMTIMEOUTS timeouts = { 0 };
-        timeouts.ReadIntervalTimeout = 0;
-        timeouts.ReadTotalTimeoutMultiplier = 0;
-        timeouts.ReadTotalTimeoutConstant = 200;
+    DWORD dwBytesDisponiveis = 0;
 
-        if (bg->hPipe == INVALID_HANDLE_VALUE || !SetCommTimeouts(bg->hPipe, &timeouts)) {
-            if (g_run_bot) LOG_DEBUG(_T("Falha ao definir timeouts ou pipe invalido. %lu"), GetLastError());
-            if (g_run_bot) Sleep(100);
-            continue;
+    while (g_run_bot) {
+        if (bg->hPipe == INVALID_HANDLE_VALUE || bg->hPipe == NULL) {
+            LOG_DEBUG(_T("threadReceberComandosServidor (%s): Pipe inválido. Saindo."), bg->bot_name);
+            g_run_bot = FALSE;
+            break;
         }
 
-        BOOL resultado = ReadFile(bg->hPipe, buffer, (BUFFER_SIZE - 1) * sizeof(TCHAR), &bytesLidos, NULL);
+        BOOL peekOk = PeekNamedPipe(bg->hPipe, NULL, 0, NULL, &dwBytesDisponiveis, NULL);
 
         if (!g_run_bot) break;
 
-        if (resultado && bytesLidos > 0) {
-            buffer[bytesLidos / sizeof(TCHAR)] = _T('\0');
-            _tprintf(_T("\n[BOT:%s <- Servidor]: %s\n"), bg->bot_name, buffer);
-
-            if (_tcsicmp(buffer, COMANDO_DESLIGAR_CLIENTE) == 0) {
-                _tprintf(_T("[BOT:%s] Recebido comando para desligar do servidor.\n"), bg->bot_name);
-                g_run_bot = FALSE;
-                break;
-            }
-
-            if (_tcsstr(buffer, _T("/rejeitado")) != NULL || _tcsstr(buffer, _T("/kick")) != NULL) {
-                _tprintf(_T("[BOT:%s] Bot rejeitado ou expulso pelo servidor. Desligando.\n"), bg->bot_name);
-                g_run_bot = FALSE;
-                break;
-            }
-
-        }
-        else if (!resultado) {
+        if (!peekOk) {
             DWORD error = GetLastError();
-            if (error != ERROR_TIMEOUT && g_run_bot) {
-                LOG_DEBUG(_T("Erro ao ler do pipe do servidor: %lu. Desligando bot '%s'."), error, bg->bot_name);
+            if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) {
+                LOG_DEBUG(_T("threadReceberComandosServidor (%s): Pipe quebrado/desconectado (PeekNamedPipe Erro: %lu)."), bg->bot_name, error);
+            }
+            else {
+                LOG_DEBUG(_T("threadReceberComandosServidor (%s): Erro ao espreitar o pipe (PeekNamedPipe Erro: %lu)."), bg->bot_name, error);
+            }
+            g_run_bot = FALSE;
+            break;
+        }
+
+        if (dwBytesDisponiveis > 0) {
+            DWORD bytesLidosNestaChamada = 0;
+            DWORD bytesParaLer = min(dwBytesDisponiveis, (BUFFER_SIZE - 1) * sizeof(TCHAR));
+
+            ZeroMemory(buffer, sizeof(buffer));
+            BOOL readOk = ReadFile(bg->hPipe, buffer, bytesParaLer, &bytesLidosNestaChamada, NULL);
+
+            if (!g_run_bot) break;
+
+            if (readOk && bytesLidosNestaChamada > 0) {
+                buffer[bytesLidosNestaChamada / sizeof(TCHAR)] = _T('\0');
+                _tprintf(_T("\n[BOT:%s <- Servidor]: %s\n"), bg->bot_name, buffer);
+
+                if (_tcsicmp(buffer, COMANDO_DESLIGAR_CLIENTE) == 0) {
+                    _tprintf(_T("[BOT:%s] Recebido comando para desligar do servidor.\n"), bg->bot_name);
+                    g_run_bot = FALSE;
+                    break;
+                }
+                if (_tcsstr(buffer, _T("/rejeitado")) != NULL || _tcsstr(buffer, _T("/kick")) != NULL) {
+                    _tprintf(_T("[BOT:%s] Bot rejeitado ou expulso pelo servidor. Desligando.\n"), bg->bot_name);
+                    g_run_bot = FALSE;
+                    break;
+                }
+            }
+            else if (!readOk) {
+                DWORD error = GetLastError();
+                LOG_DEBUG(_T("threadReceberComandosServidor (%s): Erro ao ler do pipe (ReadFile Erro: %lu)."), bg->bot_name, error);
                 g_run_bot = FALSE;
                 break;
             }
         }
-        if (bytesLidos == 0 && resultado) {
-            Sleep(50);
+        else {
+            Sleep(100);
         }
     }
+
     LOG_DEBUG(_T("Thread de escuta do servidor para o bot '%s' terminando."), bg->bot_name);
     g_run_bot = FALSE;
     return 0;
 }
 
 bool can_form_word_with_letters(const TCHAR* word_candidate_uppercase, const TCHAR* available_letters_from_mp_uppercase) {
-    int word_len = _tcslen(word_candidate_uppercase);
+    int word_len = (int)_tcslen(word_candidate_uppercase);
     if (word_len == 0) return false;
 
     TCHAR available_copy[MAXLETRAS + 1];
-    _tcscpy_s(available_copy, MAXLETRAS + 1, available_letters_from_mp_uppercase);
-    int available_len = _tcslen(available_copy);
+    _tcscpy_s(available_copy, _countof(available_copy), available_letters_from_mp_uppercase);
+    int available_len = (int)_tcslen(available_copy);
 
     for (int i = 0; i < word_len; ++i) {
         TCHAR char_needed = word_candidate_uppercase[i];
-        TCHAR* found_char_ptr = NULL;
-
+        bool found_this_char = false;
         for (int j = 0; j < available_len; ++j) {
             if (available_copy[j] == char_needed) {
-                found_char_ptr = &available_copy[j];
+                memmove(&available_copy[j], &available_copy[j + 1], (available_len - j) * sizeof(TCHAR));
+                available_len--;
+                found_this_char = true;
                 break;
             }
         }
-
-        if (found_char_ptr != NULL) {
-            int index_found = found_char_ptr - available_copy;
-            memmove(&available_copy[index_found], &available_copy[index_found + 1], (available_len - index_found) * sizeof(TCHAR));
-            available_len--;
-        }
-        else {
+        if (!found_this_char) {
             return false;
         }
     }
@@ -240,25 +293,18 @@ DWORD WINAPI threadAdivinharPalavraComDicionario(LPVOID lpParam) {
     LOG_DEBUG(_T("Thread de adivinhar palavras (com dicionario) para '%s' iniciada."), bg->bot_name);
 
     if (g_NumeroDePalavrasNoDicionario == 0) {
-        _tprintf(_T("[BOT_AVISO:%s]: Nenhum dicionário carregado. Thread de adivinhação não pode funcionar.\n"), bg->bot_name);
-        return 1;
+        _tprintf(_T("[BOT_AVISO:%s]: Nenhum dicionário carregado.\n"), bg->bot_name);
     }
 
     while (g_run_bot) {
-        DWORD wait_result = WaitForSingleObject(bg->hEvento_mp, bg->reaction_time_ms / 2);
+        DWORD wait_result_evento = WaitForSingleObject(bg->hEvento_mp, bg->reaction_time_ms / 3);
 
         if (!g_run_bot) break;
 
-        if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT) {
-            if (bg->hMutex_mp == NULL || WaitForSingleObject(bg->hMutex_mp, INFINITE) == WAIT_OBJECT_0) {
-                if (bg->hMutex_mp == NULL && _tcscmp(NOME_MUTEX, _T("")) != 0) {
-                    LOG_DEBUG(_T("threadAdivinharPalavra: Mutex da MP é NULL mas esperado. Terminando."));
-                    g_run_bot = FALSE;
-                    break;
-                }
-
-                ZeroMemory(letras_disponiveis_da_mp_upper, sizeof(letras_disponiveis_da_mp_upper));
-                int current_mp_idx = 0;
+        if (bg->hMutex_mp == NULL || WaitForSingleObject(bg->hMutex_mp, INFINITE) == WAIT_OBJECT_0) {
+            ZeroMemory(letras_disponiveis_da_mp_upper, sizeof(letras_disponiveis_da_mp_upper));
+            int current_mp_idx = 0;
+            if (bg->dados_mp != NULL) {
                 for (int i = 0; i < MAXLETRAS; ++i) {
                     if (bg->dados_mp->letras[i] != _T('\0') && bg->dados_mp->letras[i] != _T('_')) {
                         if (current_mp_idx < MAXLETRAS) {
@@ -266,128 +312,133 @@ DWORD WINAPI threadAdivinharPalavraComDicionario(LPVOID lpParam) {
                         }
                     }
                 }
-                letras_disponiveis_da_mp_upper[current_mp_idx] = _T('\0');
+            }
+            letras_disponiveis_da_mp_upper[current_mp_idx] = _T('\0');
 
-                if (bg->hMutex_mp != NULL) ReleaseMutex(bg->hMutex_mp);
+            if (bg->hMutex_mp != NULL) ReleaseMutex(bg->hMutex_mp);
 
-                LOG_DEBUG(_T("Bot '%s' - Letras disponiveis na MP: '%s'"), bg->bot_name, letras_disponiveis_da_mp_upper);
+            LOG_DEBUG(_T("Bot '%s' - Letras disponiveis na MP: '%s'"), bg->bot_name, letras_disponiveis_da_mp_upper);
 
-                if (_tcslen(letras_disponiveis_da_mp_upper) == 0) {
-                    Sleep(200);
-                    continue;
-                }
+            if (_tcslen(letras_disponiveis_da_mp_upper) == 0) {
+                Sleep(200);
+                continue;
+            }
 
+            if (!g_run_bot) break;
+
+            int think_time = bg->reaction_time_ms / 2 + (rand() % (bg->reaction_time_ms / 2 + 1));
+            // LOG_DEBUG(_T("Bot '%s' a pensar por %d ms com letras: %s"), bg->bot_name, think_time, letras_disponiveis_da_mp_upper); // Log pode ser verboso
+
+            DWORD start_think_time = GetTickCount();
+            while (GetTickCount() - start_think_time < (DWORD)think_time) {
                 if (!g_run_bot) break;
+                Sleep(50);
+            }
+            if (!g_run_bot) break;
 
-                int think_time = bg->reaction_time_ms / 2 + (rand() % (bg->reaction_time_ms / 2 + 1));
-                LOG_DEBUG(_T("Bot '%s' a pensar por %d ms com letras: %s"), bg->bot_name, think_time, letras_disponiveis_da_mp_upper);
+            TCHAR palavra_final_para_submeter[TAMANHO_MAX_PALAVRA_DICIONARIO] = { 0 };
+            bool encontrou_palavra_valida_no_dicionario = false;
+            const TCHAR* pPalavraOriginalDoDicionario = NULL;
 
-                DWORD start_think_time = GetTickCount();
-                while (GetTickCount() - start_think_time < (DWORD)think_time) {
-                    if (!g_run_bot) break;
-                    Sleep(50);
-                }
-                if (!g_run_bot) break;
+            if (g_NumeroDePalavrasNoDicionario > 0 && (rand() % 100) >= CHANCE_BOT_TENTAR_PALAVRA_ERRADA) {
+                int melhor_comprimento_palavra = 0;
+                TCHAR palavra_dicionario_upper[TAMANHO_MAX_PALAVRA_DICIONARIO];
+                int* indices_dicionario = malloc(g_NumeroDePalavrasNoDicionario * sizeof(int));
 
-                // Decidir se tenta um palavra errada ou procura no dicionário
-                if ((rand() % 100) < CHANCE_BOT_TENTAR_PALAVRA_ERRADA && _tcslen(letras_disponiveis_da_mp_upper) >= MIN_LEN_PALAVRA_ERRADA) {
-                    TCHAR palavra_errada[TAMANHO_MAX_PALAVRA_DICIONARIO] = { 0 };
-                    int len_palavra = MIN_LEN_PALAVRA_ERRADA + (rand() % (MAX_LEN_PALAVRA_ERRADA - MIN_LEN_PALAVRA_ERRADA + 1));
-
-                    // Garante que o palavra não é maior que as letras disponíveis ou o buffer
-                    if (len_palavra > (int)_tcslen(letras_disponiveis_da_mp_upper)) {
-                        len_palavra = _tcslen(letras_disponiveis_da_mp_upper);
+                if (indices_dicionario != NULL) {
+                    for (int k = 0; k < g_NumeroDePalavrasNoDicionario; ++k) indices_dicionario[k] = k;
+                    for (int k = g_NumeroDePalavrasNoDicionario - 1; k > 0; --k) {
+                        int j_rand = rand() % (k + 1);
+                        int temp_idx = indices_dicionario[k];
+                        indices_dicionario[k] = indices_dicionario[j_rand];
+                        indices_dicionario[j_rand] = temp_idx;
                     }
-                    if (len_palavra >= TAMANHO_MAX_PALAVRA_DICIONARIO) {
-                        len_palavra = TAMANHO_MAX_PALAVRA_DICIONARIO - 1;
-                    }
-                    if (len_palavra < MIN_LEN_PALAVRA_ERRADA && _tcslen(letras_disponiveis_da_mp_upper) >= MIN_LEN_PALAVRA_ERRADA) {
-                        len_palavra = MIN_LEN_PALAVRA_ERRADA;
-                    }
-                    if (len_palavra <= 0) {
-                        LOG_DEBUG(_T("Bot '%s' não tem letras suficientes para um palavra errada."), bg->bot_name);
-                    }
-                    else {
-                        for (int i = 0; i < len_palavra; ++i) {
-                            palavra_errada[i] = letras_disponiveis_da_mp_upper[rand() % _tcslen(letras_disponiveis_da_mp_upper)];
-                        }
-                        palavra_errada[len_palavra] = _T('\0');
-
-                        _tprintf(_T("[BOT:%s] Tentando palavra errada: '%s'\n"), bg->bot_name, palavra_errada);
-                        if (!enviarMensagemPipeBot(bg->hPipe, palavra_errada)) {
-                            LOG_DEBUG(_T("Falha ao enviar palavra errada '%s' pelo bot '%s'. Desligando."), palavra_errada, bg->bot_name);
-                            g_run_bot = FALSE;
-                        }
-                        Sleep(bg->reaction_time_ms / 2);
-                    }
-                }
-                else {
-                    // Procurar no dicionário
-                    const TCHAR* palavra_a_submeter_original = NULL;
-                    int melhor_comprimento_palavra = 0;
-                    TCHAR palavra_dicionario_upper[TAMANHO_MAX_PALAVRA_DICIONARIO];
-
-                    for (int i = 0; i < g_NumeroDePalavrasNoDicionario; ++i) {
+                    for (int k_idx = 0; k_idx < g_NumeroDePalavrasNoDicionario; ++k_idx) {
                         if (!g_run_bot) break;
-
-                        _tcscpy_s(palavra_dicionario_upper, TAMANHO_MAX_PALAVRA_DICIONARIO, g_Dicionario[i]);
+                        int i_dic = indices_dicionario[k_idx];
+                        _tcscpy_s(palavra_dicionario_upper, TAMANHO_MAX_PALAVRA_DICIONARIO, g_Dicionario[i_dic]);
                         _tcsupr_s(palavra_dicionario_upper, TAMANHO_MAX_PALAVRA_DICIONARIO);
 
                         if (can_form_word_with_letters(palavra_dicionario_upper, letras_disponiveis_da_mp_upper)) {
-                            int len_atual = _tcslen(palavra_dicionario_upper);
+                            int len_atual = (int)_tcslen(palavra_dicionario_upper);
                             if (len_atual > melhor_comprimento_palavra) {
                                 melhor_comprimento_palavra = len_atual;
-                                palavra_a_submeter_original = g_Dicionario[i];
+                                pPalavraOriginalDoDicionario = g_Dicionario[i_dic];
                             }
                         }
                     }
+                    free(indices_dicionario);
+                }
+                if (pPalavraOriginalDoDicionario != NULL) {
+                    _tcscpy_s(palavra_final_para_submeter, _countof(palavra_final_para_submeter), pPalavraOriginalDoDicionario);
+                    encontrou_palavra_valida_no_dicionario = true;
+                    LOG_DEBUG(_T("Bot '%s' (Dicionario) encontrou: '%s'"), bg->bot_name, palavra_final_para_submeter);
+                }
+                else {
+                    LOG_DEBUG(_T("Bot '%s' (Dicionario) não encontrou palavras formáveis com '%s'."), bg->bot_name, letras_disponiveis_da_mp_upper);
+                }
+            }
 
-                    if (palavra_a_submeter_original != NULL) {
-                        TCHAR palavra_final_para_submeter[TAMANHO_MAX_PALAVRA_DICIONARIO];
-                        _tcscpy_s(palavra_final_para_submeter, _countof(palavra_final_para_submeter), palavra_a_submeter_original);
+            if (!encontrou_palavra_valida_no_dicionario && _tcslen(letras_disponiveis_da_mp_upper) >= MIN_LEN_PALAVRA_ERRADA) {
+                int len_palavra_errada = MIN_LEN_PALAVRA_ERRADA + (rand() % (min(MAX_LEN_PALAVRA_ERRADA, (int)_tcslen(letras_disponiveis_da_mp_upper)) - MIN_LEN_PALAVRA_ERRADA + 1));
+                len_palavra_errada = min(len_palavra_errada, TAMANHO_MAX_PALAVRA_DICIONARIO - 1);
 
-                        if ((rand() % 100) < CHANCE_BOT_DIGITAR_ERRADO && _tcslen(palavra_final_para_submeter) > 0) {
-                            int pos_erro = rand() % _tcslen(palavra_final_para_submeter);
-                            TCHAR letra_original_case = palavra_final_para_submeter[pos_erro];
-                            TCHAR letra_errada_gerada;
-                            do {
-                                letra_errada_gerada = _T('A') + (rand() % 26);
-                            } while (letra_errada_gerada == _totupper(letra_original_case));
+                if (len_palavra_errada > 0 && _tcslen(letras_disponiveis_da_mp_upper) > 0) {
+                    for (int i = 0; i < len_palavra_errada; ++i) {
+                        palavra_final_para_submeter[i] = letras_disponiveis_da_mp_upper[rand() % _tcslen(letras_disponiveis_da_mp_upper)];
+                    }
+                    palavra_final_para_submeter[len_palavra_errada] = _T('\0');
+                    LOG_DEBUG(_T("Bot '%s' (Errada) vai tentar: '%s'"), bg->bot_name, palavra_final_para_submeter);
+                }
+                else {
+                    LOG_DEBUG(_T("Bot '%s' (Errada) não pôde gerar palavra aleatória (letras_disponiveis: '%s', len_errada: %d)."), bg->bot_name, letras_disponiveis_da_mp_upper, len_palavra_errada);
+                }
+            }
 
-                            if (_istlower(letra_original_case)) {
-                                palavra_final_para_submeter[pos_erro] = _totlower(letra_errada_gerada);
-                            }
-                            else {
-                                palavra_final_para_submeter[pos_erro] = letra_errada_gerada;
-                            }
-                            _tprintf(_T("[BOT:%s] Oops! Ia submeter '%s', mas 'digitou errado': '%s'\n"), bg->bot_name, palavra_a_submeter_original, palavra_final_para_submeter);
-                        }
+            if (_tcslen(palavra_final_para_submeter) > 0) {
+                if ((rand() % 100) < CHANCE_BOT_DIGITAR_ERRADO) { // Removido _tcslen > 0, já verificado acima
+                    int pos_erro = rand() % (int)_tcslen(palavra_final_para_submeter);
+                    TCHAR letra_original_case = palavra_final_para_submeter[pos_erro];
+                    TCHAR letra_errada_gerada;
+                    do {
+                        letra_errada_gerada = _T('A') + (rand() % 26);
+                    } while (letra_errada_gerada == _totupper(letra_original_case));
 
-                        if ((rand() % 100) < CHANCE_TO_SUBMIT_WORD) {
-                            _tprintf(_T("[BOT:%s] Tentando submeter: '%s'\n"), bg->bot_name, palavra_final_para_submeter);
-                            if (!enviarMensagemPipeBot(bg->hPipe, palavra_final_para_submeter)) {
-                                LOG_DEBUG(_T("Falha ao enviar palavra '%s' pelo bot '%s'. Desligando."), palavra_final_para_submeter, bg->bot_name);
-                                g_run_bot = FALSE;
-                            }
-                            Sleep(bg->reaction_time_ms);
-                        }
-                        else {
-                            LOG_DEBUG(_T("Bot '%s' (Dicionario) decidiu não submeter '%s' desta vez."), bg->bot_name, palavra_final_para_submeter);
-                        }
+                    if (_istlower(letra_original_case)) {
+                        palavra_final_para_submeter[pos_erro] = _totlower(letra_errada_gerada);
                     }
                     else {
-                        LOG_DEBUG(_T("Bot '%s' (Dicionario) não encontrou palavras formáveis com '%s'."), bg->bot_name, letras_disponiveis_da_mp_upper);
+                        palavra_final_para_submeter[pos_erro] = letra_errada_gerada;
                     }
+                    _tprintf(_T("[BOT:%s] Oops! Preparou '%s', mas 'digitou errado': '%s'\n"), bg->bot_name,
+                        (encontrou_palavra_valida_no_dicionario && pPalavraOriginalDoDicionario ? pPalavraOriginalDoDicionario : _T("palavra_aleatoria")),
+                        palavra_final_para_submeter);
+                }
+
+                if ((rand() % 100) < CHANCE_TO_SUBMIT_WORD) {
+                    _tprintf(_T("[BOT:%s -> Servidor]: %s\n"), bg->bot_name, palavra_final_para_submeter);
+                    if (!enviarMensagemPipeBot(bg->hPipe, palavra_final_para_submeter)) {
+                        LOG_DEBUG(_T("Falha ao enviar palavra '%s' pelo bot '%s'. Desligando."), palavra_final_para_submeter, bg->bot_name);
+                        g_run_bot = FALSE;
+                    }
+                    int post_submit_wait = bg->reaction_time_ms / 2 + (rand() % (bg->reaction_time_ms / 2 + 1));
+                    Sleep(post_submit_wait);
+                }
+                else {
+                    LOG_DEBUG(_T("Bot '%s' decidiu não submeter '%s' desta vez."), bg->bot_name, palavra_final_para_submeter);
                 }
             }
             else {
-                LOG_DEBUG(_T("threadAdivinharPalavra para '%s': Falha ao obter mutex da MP."), bg->bot_name);
-                if (g_run_bot) Sleep(100);
+                LOG_DEBUG(_T("Bot '%s' não conseguiu gerar nenhuma palavra para submeter desta vez."), bg->bot_name);
             }
         }
-        else if (wait_result == WAIT_FAILED) {
+        else if (wait_result_evento == WAIT_FAILED) {
             LOG_DEBUG(_T("threadAdivinharPalavra para '%s': Falha ao esperar pelo hEvento_mp. Erro: %lu"), bg->bot_name, GetLastError());
             g_run_bot = FALSE;
+        }
+        else {
+            LOG_DEBUG(_T("threadAdivinharPalavra para '%s': Falha ao obter mutex da MP."), bg->bot_name);
+            if (g_run_bot) Sleep(200);
         }
     }
     LOG_DEBUG(_T("Thread de adivinhar palavras (com dicionario) para '%s' terminando."), bg->bot_name);
@@ -398,62 +449,98 @@ int setup_bot(bot_globals* bg, int argc, TCHAR* argv[]) {
     ZeroMemory(bg, sizeof(bot_globals));
     srand((unsigned int)time(NULL) + GetCurrentProcessId());
 
-    _stprintf_s(bg->bot_name, _countof(bg->bot_name), _T("%s%d"), BOT_NAME_PREFIX, rand() % 1000);
+    TCHAR* nomePipeServidor = NULL;
+    if (argc > 1 && argv[1] != NULL && _tcslen(argv[1]) > 0) {
+        nomePipeServidor = argv[1];
+    }
+    else {
+        _tprintf(_T("[BOT_ERRO_FATAL]: Nome do pipe do servidor não fornecido como primeiro argumento.\n"));
+        return 1;
+    }
+
+    if (argc > 2 && argv[2] != NULL && _tcslen(argv[2]) > 0) {
+        StringCchCopy(bg->bot_name, _countof(bg->bot_name), argv[2]);
+        _tprintf(_T("[BOT_INFO] Iniciando com nome fornecido pelo admin: %s\n"), bg->bot_name);
+    }
+    else {
+        _stprintf_s(bg->bot_name, _countof(bg->bot_name), _T("%s%d"), BOT_NAME_PREFIX_DEFAULT, rand() % 1000);
+        _tprintf(_T("[BOT_INFO] Nome não fornecido, usando gerado: %s\n"), bg->bot_name);
+    }
+
     bg->reaction_time_ms = MIN_REACTION_MS + (rand() % (MAX_REACTION_MS - MIN_REACTION_MS + 1));
+    _tprintf(_T("[BOT_INFO:%s] (Reação: %dms)\n"), bg->bot_name, bg->reaction_time_ms);
 
-    _tprintf(_T("[BOT_INFO] Iniciando como: %s (Reação: %dms)\n"), bg->bot_name, bg->reaction_time_ms);
-
-    if (!carregarDicionario()) {
-        _tprintf(_T("[BOT_ERRO_FATAL]: Falha ao carregar o dicionário. Bot não pode funcionar sem ele.\n"));
+    if (!carregarDicionarioBot()) {
+        _tprintf(_T("[BOT_ERRO_FATAL:%s]: Falha ao carregar o dicionário.\n"), bg->bot_name);
         return 1;
     }
 
     if (!SetConsoleCtrlHandler(CtrlHandler_Bot, TRUE)) {
-        _tprintf(_T("[BOT_ERRO] Não foi possível definir o handler da consola (Ctrl-C).\n"));
+        _tprintf(_T("[BOT_ERRO:%s] Não foi possível definir o handler da consola (Ctrl-C).\n"), bg->bot_name);
     }
 
-    if (_tcscmp(NOME_MUTEX, _T("")) != 0) {
+    if (NOME_MUTEX != NULL && _tcscmp(NOME_MUTEX, _T("")) != 0) {
         bg->hMutex_mp = OpenMutex(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, NOME_MUTEX);
         if (bg->hMutex_mp == NULL) {
-            _tprintf(_T("[BOT_ERRO] Falha ao abrir Mutex MP '%s' (%lu).\n"), NOME_MUTEX, GetLastError());
-            return 1;
+            _tprintf(_T("[BOT_ERRO:%s] Falha ao abrir Mutex MP '%s' (%lu).\n"), bg->bot_name, NOME_MUTEX, GetLastError());
+            cleanup_bot(bg); return 1; // Chamar cleanup se falhar aqui
         }
     }
     else {
         bg->hMutex_mp = NULL;
+        _tprintf(_T("[BOT_INFO:%s] Não tentando abrir Mutex MP (NOME_MUTEX vazio ou NULL).\n"), bg->bot_name);
     }
 
     bg->hEvento_mp = OpenEvent(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, NOME_EVENTO);
     if (bg->hEvento_mp == NULL) {
-        _tprintf(_T("[BOT_ERRO] Falha ao abrir Evento MP '%s' (%lu).\n"), NOME_EVENTO, GetLastError());
-        return 1;
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao abrir Evento MP '%s' (%lu).\n"), bg->bot_name, NOME_EVENTO, GetLastError());
+        cleanup_bot(bg); return 1;
     }
+
     bg->hMapFile_mp = OpenFileMapping(FILE_MAP_READ, FALSE, NOME_MP);
     if (bg->hMapFile_mp == NULL) {
-        _tprintf(_T("[BOT_ERRO] Falha ao abrir Mapeamento MP '%s' (%lu).\n"), NOME_MP, GetLastError());
-        return 1;
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao abrir Mapeamento MP '%s' (%lu).\n"), bg->bot_name, NOME_MP, GetLastError());
+        cleanup_bot(bg); return 1;
     }
+
     bg->dados_mp = (MP*)MapViewOfFile(bg->hMapFile_mp, FILE_MAP_READ, 0, 0, sizeof(MP));
     if (bg->dados_mp == NULL) {
-        _tprintf(_T("[BOT_ERRO] Falha ao mapear View MP '%s' (%lu).\n"), NOME_MP, GetLastError());
-        return 1;
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao mapear View MP '%s' (%lu).\n"), bg->bot_name, NOME_MP, GetLastError());
+        cleanup_bot(bg); return 1;
     }
     LOG_DEBUG(_T("Bot '%s' conectado à memória partilhada com sucesso."), bg->bot_name);
 
     bg->hPipe = CreateFile(
-        PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        nomePipeServidor,
+        GENERIC_READ | GENERIC_WRITE,
+        0, NULL, OPEN_EXISTING, 0, NULL); // Removido FILE_FLAG_OVERLAPPED por simplicidade, já que PeekNamedPipe é usado
+
     if (bg->hPipe == INVALID_HANDLE_VALUE) {
-        _tprintf(_T("[BOT_ERRO:%s] Falha ao conectar ao pipe '%s' (%lu).\n"), bg->bot_name, PIPE_NAME, GetLastError());
-        return 1;
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao conectar ao pipe '%s' (%lu).\n"), bg->bot_name, nomePipeServidor, GetLastError());
+        cleanup_bot(bg); return 1;
     }
-    LOG_DEBUG(_T("Bot '%s' conectado ao pipe do servidor com sucesso."), bg->bot_name);
+    LOG_DEBUG(_T("Bot '%s' conectado ao pipe do servidor '%s' com sucesso."), bg->bot_name, nomePipeServidor);
 
     DWORD dwMode = PIPE_READMODE_MESSAGE;
     if (!SetNamedPipeHandleState(bg->hPipe, &dwMode, NULL, NULL)) {
         LOG_DEBUG(_T("Falha ao definir modo de mensagem do pipe para bot '%s' (%lu) - continuando."), bg->bot_name, GetLastError());
     }
-
     return 0;
+}
+
+
+// Wrapper para atexit, pois atexit espera void func(void)
+// A definição completa deve estar aqui, antes de ser usada em _tmain.
+void cleanup_bot_wrapper(void) {
+    if (g_bot_globals_for_atexit != NULL) {
+        const TCHAR* botNameForLog = (_tcslen(g_bot_globals_for_atexit->bot_name) > 0) ?
+            g_bot_globals_for_atexit->bot_name : _T("NomeIndefinido");
+        _tprintf(_T("[BOT_ATEXIT:%s] Chamando cleanup_bot via atexit.\n"), botNameForLog);
+        cleanup_bot(g_bot_globals_for_atexit);
+    }
+    else {
+        _tprintf(_T("[BOT_ATEXIT] g_bot_globals_for_atexit é NULL, não pode limpar.\n"));
+    }
 }
 
 int _tmain(int argc, TCHAR* argv[]) {
@@ -462,56 +549,134 @@ int _tmain(int argc, TCHAR* argv[]) {
     _setmode(_fileno(stderr), _O_WTEXT);
 #endif
 
-    bot_globals bg;
-    ZeroMemory(&bg, sizeof(bot_globals));
+    bot_globals bg_local_main;
+    ZeroMemory(&bg_local_main, sizeof(bot_globals));
+
+    g_bot_globals_for_atexit = &bg_local_main;
+
+    if (atexit(cleanup_bot_wrapper) != 0) {
+        _tprintf(_T("[BOT_AVISO] Falha ao registrar a função atexit para limpeza.\n"));
+    }
 
     _tprintf(_T("[BOT_MAIN] Iniciando...\n"));
 
-    if (setup_bot(&bg, argc, argv) != 0) {
+    if (argc < 3) {
+        _tprintf(_T("Uso: %s <NomeDoPipeServidor> <NomeDoBot>\n"), (argc > 0 ? argv[0] : _T("bot.exe")));
+        _tprintf(_T("Exemplo: %s \\\\.\\pipe\\pipe BotAmigo\n"), (argc > 0 ? argv[0] : _T("bot.exe")));
+        return 1;
+    }
+
+    // O setup_bot agora deve ser chamado ANTES do envio do login, pois ele conecta o pipe.
+    if (setup_bot(&bg_local_main, argc, argv) != 0) {
         _tprintf(_T("[BOT_MAIN] Falha no setup. Encerrando.\n"));
-        cleanup_bot(&bg);
         _tprintf(_T("[BOT_MAIN] Pressione Enter para sair.\n"));
         if (_gettchar() == EOF) {};
         return 1;
     }
 
-    _tprintf(_T("[BOT_MAIN:%s] Setup completo. Iniciando threads de jogo.\n"), bg.bot_name);
+    // APÓS setup_bot ser bem-sucedido (pipe conectado, nome do bot definido em bg_local_main.bot_name):
+    _tprintf(_T("[BOT_MAIN:%s] Setup completo. Tentando login no servidor...\n"), bg_local_main.bot_name);
 
-    HANDLE hThreadComandosServidor = CreateThread(NULL, 0, threadReceberComandosServidor, &bg, 0, NULL);
-    HANDLE hThreadAdivinharPalavra = CreateThread(NULL, 0, threadAdivinharPalavraComDicionario, &bg, 0, NULL);
+    TCHAR loginCmd[BUFFER_SIZE];
+    // Usar StringCchPrintf para segurança
+    HRESULT hr = StringCchPrintf(loginCmd, _countof(loginCmd), _T("/login %s"), bg_local_main.bot_name);
 
-    if (hThreadComandosServidor == NULL || hThreadAdivinharPalavra == NULL) {
-        _tprintf(_T("[BOT_ERRO:%s] Falha ao criar uma ou mais threads principais.\n"), bg.bot_name);
-        g_run_bot = FALSE;
+    if (FAILED(hr)) {
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao formatar comando de login. Encerrando.\n"), bg_local_main.bot_name);
+        // cleanup_bot já está registrada com atexit, então apenas retornamos.
+        return 1;
+    }
 
-        if (hThreadComandosServidor) { WaitForSingleObject(hThreadComandosServidor, 1000); CloseHandle(hThreadComandosServidor); }
-        if (hThreadAdivinharPalavra) { WaitForSingleObject(hThreadAdivinharPalavra, 1000); CloseHandle(hThreadAdivinharPalavra); }
+    if (!enviarMensagemPipeBot(bg_local_main.hPipe, loginCmd)) {
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao enviar comando de login para o servidor. Encerrando.\n"), bg_local_main.bot_name);
+        return 1;
+    }
+    _tprintf(_T("[BOT_MAIN:%s] Comando de login enviado: '%s'. Aguardando resposta...\n"), bg_local_main.bot_name, loginCmd);
+
+    // Esperar pela resposta do login do servidor
+    TCHAR respostaLogin[BUFFER_SIZE];
+    DWORD bytesLidosLogin;
+
+    // Configurar timeouts para a leitura da resposta do login
+    COMMTIMEOUTS timeoutsLogin = { 0 };
+    timeoutsLogin.ReadIntervalTimeout = 0; // Não usar timeouts de intervalo para ReadFile síncrono simples
+    timeoutsLogin.ReadTotalTimeoutMultiplier = 0;
+    timeoutsLogin.ReadTotalTimeoutConstant = 10000; // Esperar até 10 segundos pela resposta do login
+
+    if (!SetCommTimeouts(bg_local_main.hPipe, &timeoutsLogin)) {
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao definir timeouts para resposta de login. Erro: %lu. Encerrando.\n"), bg_local_main.bot_name, GetLastError());
+        return 1;
+    }
+
+    ZeroMemory(respostaLogin, sizeof(respostaLogin));
+    if (ReadFile(bg_local_main.hPipe, respostaLogin, (sizeof(respostaLogin) / sizeof(TCHAR) - 1) * sizeof(TCHAR), &bytesLidosLogin, NULL) && bytesLidosLogin > 0) {
+        respostaLogin[bytesLidosLogin / sizeof(TCHAR)] = _T('\0');
+        _tprintf(_T("[BOT_MAIN:%s] Resposta do login do servidor: '%s'\n"), bg_local_main.bot_name, respostaLogin);
+
+        if (_tcsicmp(respostaLogin, _T("/login_ok")) != 0) {
+            _tprintf(_T("[BOT_ERRO:%s] Login falhou ou foi rejeitado pelo servidor. Motivo: '%s'. Encerrando.\n"), bg_local_main.bot_name, respostaLogin);
+            return 1;
+        }
+        _tprintf(_T("[BOT_MAIN:%s] Login bem-sucedido no servidor!\n"), bg_local_main.bot_name);
     }
     else {
-        _tprintf(_T("[BOT_MAIN:%s] está a correr...\n"), bg.bot_name);
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao receber resposta de login do servidor ou pipe fechado. Erro: %lu. Encerrando.\n"), bg_local_main.bot_name, GetLastError());
+        return 1;
+    }
+
+    // Após o login bem-sucedido, pode ser necessário restaurar os timeouts do pipe se 
+    // a threadReceberComandosServidor usar ReadFile com timeouts diferentes ou se
+    // PeekNamedPipe não for o suficiente e timeouts no handle forem desejados para ela.
+    // No seu caso, threadReceberComandosServidor usa PeekNamedPipe, então não precisa mexer nos timeouts aqui.
+
+
+    _tprintf(_T("[BOT_MAIN:%s] Iniciando threads de comportamento do bot...\n"), bg_local_main.bot_name);
+
+    HANDLE hThreads[2];
+    hThreads[0] = CreateThread(NULL, 0, threadReceberComandosServidor, &bg_local_main, 0, NULL);
+    hThreads[1] = CreateThread(NULL, 0, threadAdivinharPalavraComDicionario, &bg_local_main, 0, NULL);
+
+    if (hThreads[0] == NULL || hThreads[1] == NULL) {
+        _tprintf(_T("[BOT_ERRO:%s] Falha ao criar uma ou mais threads principais de comportamento.\n"), bg_local_main.bot_name);
+        g_run_bot = FALSE;
+
+        if (hThreads[0]) { WaitForSingleObject(hThreads[0], 2000); CloseHandle(hThreads[0]); }
+        if (hThreads[1]) { WaitForSingleObject(hThreads[1], 2000); CloseHandle(hThreads[1]); }
+    }
+    else {
+        _tprintf(_T("[BOT_MAIN:%s] está a correr... (Pressione Ctrl+C para sair)\n"), bg_local_main.bot_name);
 
         while (g_run_bot) {
+            // ... (lógica de monitoramento das threads como antes) ...
             DWORD exitCodeCmd = STILL_ACTIVE, exitCodeAdv = STILL_ACTIVE;
-            BOOL cmdOk = GetExitCodeThread(hThreadComandosServidor, &exitCodeCmd);
-            BOOL advOk = GetExitCodeThread(hThreadAdivinharPalavra, &exitCodeAdv);
+            BOOL cmdOk = FALSE, advOk = FALSE;
+
+            if (hThreads[0]) cmdOk = GetExitCodeThread(hThreads[0], &exitCodeCmd);
+            if (hThreads[1]) advOk = GetExitCodeThread(hThreads[1], &exitCodeAdv);
 
             if ((cmdOk && exitCodeCmd != STILL_ACTIVE) || (advOk && exitCodeAdv != STILL_ACTIVE)) {
-                LOG_DEBUG(_T("Uma das threads do bot '%s' terminou. CmdExit: %lu, AdvExit: %lu. Sinalizando paragem."), bg.bot_name, exitCodeCmd, exitCodeAdv);
+                LOG_DEBUG(_T("Uma das threads do bot '%s' terminou. CmdExit: %lu (%s), AdvExit: %lu (%s). Sinalizando paragem."),
+                    bg_local_main.bot_name,
+                    exitCodeCmd, (cmdOk && exitCodeCmd != STILL_ACTIVE) ? _T("terminou") : _T("ativa"),
+                    exitCodeAdv, (advOk && exitCodeAdv != STILL_ACTIVE) ? _T("terminou") : _T("ativa"));
                 g_run_bot = FALSE;
             }
             Sleep(500);
         }
 
-        _tprintf(_T("[BOT_MAIN:%s] Sinal de terminação recebido ou thread terminou. Aguardando threads...\n"), bg.bot_name);
-        if (hThreadComandosServidor) WaitForSingleObject(hThreadComandosServidor, INFINITE);
-        if (hThreadAdivinharPalavra) WaitForSingleObject(hThreadAdivinharPalavra, INFINITE);
+        _tprintf(_T("[BOT_MAIN:%s] Sinal de terminação recebido ou thread terminou. Aguardando threads de comportamento...\n"), bg_local_main.bot_name);
+        g_run_bot = FALSE;
 
-        if (hThreadComandosServidor) CloseHandle(hThreadComandosServidor);
-        if (hThreadAdivinharPalavra) CloseHandle(hThreadAdivinharPalavra);
+        if (hThreads[0]) WaitForSingleObject(hThreads[0], INFINITE);
+        if (hThreads[1]) WaitForSingleObject(hThreads[1], INFINITE);
+
+        if (hThreads[0]) CloseHandle(hThreads[0]);
+        if (hThreads[1]) CloseHandle(hThreads[1]);
+        _tprintf(_T("[BOT_MAIN:%s] Threads de comportamento terminadas.\n"), bg_local_main.bot_name);
     }
 
-    cleanup_bot(&bg);
-    _tprintf(_T("[BOT_MAIN:%s] Desligado.\n"), bg.bot_name);
+    _tprintf(_T("[BOT_MAIN:%s] Encerrando.\n"), bg_local_main.bot_name);
+    // cleanup_bot_wrapper será chamado por atexit.
 
     return 0;
 }

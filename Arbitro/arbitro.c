@@ -56,6 +56,7 @@ typedef struct {
 
 typedef struct {
 	HANDLE hPipeCliente;
+	DWORD dwThreadIdCliente;
     int id_jogador;
     TCHAR nome[NAME_SIZE];
     int pontos;
@@ -466,22 +467,127 @@ bool checkPalavraValidaEProcessar(const TCHAR* palavra_jogador, clienteAux* aux,
     return palavra_valida;
 }
 
+BOOL loginCliente(clienteAux* aux) {
+    if (aux == NULL || aux->g == NULL || aux->hPipeCliente == INVALID_HANDLE_VALUE) {
+        LOG_DEBUG(_T("loginCliente: Parâmetros inválidos."));
+        return FALSE;
+    }
+
+    TCHAR buffer[BUFFER_SIZE];
+    DWORD bytesLidos;
+    BOOL loginSucesso = FALSE;
+
+    LOG_DEBUG(_T("loginCliente (pipe %p): Aguardando dados de login do cliente..."), aux->hPipeCliente);
+
+    ZeroMemory(buffer, sizeof(buffer));
+    if (ReadFile(aux->hPipeCliente, buffer, (sizeof(buffer) / sizeof(TCHAR) - 1) * sizeof(TCHAR), &bytesLidos, NULL)) {
+        if (bytesLidos > 0) {
+            buffer[bytesLidos / sizeof(TCHAR)] = _T('\0');
+            LOG_DEBUG(_T("loginCliente (pipe %p): Recebido para login: '%s'"), aux->hPipeCliente, buffer);
+
+            TCHAR* comando = NULL;
+            TCHAR* nome = NULL;
+            TCHAR* pContext = NULL;
+
+            comando = _tcstok_s(buffer, _T(" "), &pContext);
+            if (comando != NULL) {
+                nome = _tcstok_s(NULL, _T(" \r\n"), &pContext);
+            }
+
+            if (comando != NULL && _tcsicmp(comando, _T("/login")) == 0 &&
+                nome != NULL && _tcslen(nome) > 0 && _tcslen(nome) < NAME_SIZE) {
+
+                if (WaitForSingleObject(aux->g->listaJogadores->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
+                    bool nome_ja_existe = false;
+                    for (int i = 0; i < aux->g->listaJogadores->num_jogadores; ++i) {
+                        if (_tcsicmp(aux->g->listaJogadores->jogadores[i].nome, nome) == 0) {
+                            nome_ja_existe = true;
+                            break;
+                        }
+                    }
+
+                    if (aux->g->listaJogadores->num_jogadores < MAXJOGADORES && !nome_ja_existe) {
+                        aux->id_jogador = aux->g->listaJogadores->prox_id_jogador;
+                        StringCchCopy(aux->nome, NAME_SIZE, nome);
+                        aux->pontos = 0;
+
+                        jogador* pJogadorNaLista = &aux->g->listaJogadores->jogadores[aux->g->listaJogadores->num_jogadores];
+                        pJogadorNaLista->id_jogador = aux->id_jogador;
+                        StringCchCopy(pJogadorNaLista->nome, NAME_SIZE, aux->nome);
+                        pJogadorNaLista->pontos = aux->pontos;
+                        pJogadorNaLista->hPipeCliente = aux->hPipeCliente;
+                        pJogadorNaLista->dwThreadIdCliente = GetCurrentThreadId(); 
+
+                        aux->g->listaJogadores->num_jogadores++;
+                        aux->g->listaJogadores->prox_id_jogador++;
+
+                        ReleaseMutex(aux->g->listaJogadores->g_hMutexJogadores);
+
+                        enviarMensagemPipe(aux->hPipeCliente, _T("/login_ok"));
+                        loginSucesso = TRUE;
+                        escreverOutput(aux->g, _T("Cliente '%s' (ID: %d, Pipe: %p) logado com sucesso. Jogadores: %d"),
+                            aux->nome, aux->id_jogador, aux->hPipeCliente, aux->g->listaJogadores->num_jogadores);
+                    }
+                    else {
+                        ReleaseMutex(aux->g->listaJogadores->g_hMutexJogadores);
+                        TCHAR msgFalha[128];
+                        if (nome_ja_existe) {
+                            StringCchPrintf(msgFalha, _countof(msgFalha), _T("/login_fail Nome '%s' ja em uso."), nome);
+                            escreverOutput(aux->g, _T("Falha no login (pipe %p): Nome '%s' já em uso."), aux->hPipeCliente, nome);
+                        }
+                        else { // Servidor cheio
+                            StringCchCopy(msgFalha, _countof(msgFalha), _T("/login_fail Servidor cheio."));
+                            escreverOutput(aux->g, _T("Falha no login (pipe %p): Servidor cheio."), aux->hPipeCliente);
+                        }
+                        enviarMensagemPipe(aux->hPipeCliente, msgFalha);
+                    }
+                }
+                else {
+                    LOG_DEBUG(_T("loginCliente (pipe %p): Falha ao obter mutex da lista de jogadores."), aux->hPipeCliente);
+                    enviarMensagemPipe(aux->hPipeCliente, _T("/login_fail ErroInternoServidor"));
+                }
+            }
+            else { // Comando de login inválido
+                LOG_DEBUG(_T("loginCliente (pipe %p): Comando de login inválido ou nome ausente: '%s'"), aux->hPipeCliente, buffer);
+                enviarMensagemPipe(aux->hPipeCliente, _T("/login_fail FormatoInvalido"));
+            }
+        }
+        else 
+            LOG_DEBUG(_T("loginCliente (pipe %p): Nenhum dado de login recebido ou cliente desconectou."), aux->hPipeCliente);        
+    }
+    else { // ReadFile falhou
+        DWORD dwError = GetLastError();
+        LOG_DEBUG(_T("loginCliente (pipe %p): Erro ao ler dados para login: %lu."), aux->hPipeCliente, dwError);
+    }
+    return loginSucesso;
+}
+
 // e preciso de trocar os timeouts para peek pipe, senao o readfile bloqueia
 DWORD WINAPI receberComandos(LPVOID lpParam) {
     clienteAux* aux = (clienteAux*)lpParam;
 	if (aux == NULL) return 1;
+
+    BOOL clienteLogin = FALSE; 
+
+    if (run) 
+        clienteLogin = loginCliente(aux);
+
+    if (!run || !clienteLogin) {
+        LOG_DEBUG(_T("Thread de cliente (Pipe %p): Login falhou ou servidor desligando. Terminando."), aux->hPipeCliente);
+        if (aux->hPipeCliente != NULL && aux->hPipeCliente != INVALID_HANDLE_VALUE) {
+            DisconnectNamedPipe(aux->hPipeCliente);
+            CloseHandle(aux->hPipeCliente);
+            aux->hPipeCliente = INVALID_HANDLE_VALUE;
+        }
+        free(aux);
+        return 1;
+    }
     
-    LOG_DEBUG(_T("Thread de recebimento de comandos iniciada para o cliente %s (ID: %d, Pipe: %p)."),
-        aux->nome, aux->id_jogador, aux->hPipeCliente);
+    LOG_DEBUG(_T("Thread de recebimento de comandos iniciada para o cliente %s (ID: %d, Pipe: %p)."), aux->nome, aux->id_jogador, aux->hPipeCliente);
 
     HANDLE hPipeCliente = aux->hPipeCliente;
     BOOL clienteConectado = TRUE;
     TCHAR buffer[BUFFER_SIZE];
-
-    COMMTIMEOUTS timeouts = { 0 };
-    timeouts.ReadIntervalTimeout = 5000; // ms
-    timeouts.ReadTotalTimeoutMultiplier = 10; // ms
-    timeouts.ReadTotalTimeoutConstant = 500;
 
 	while (run && clienteConectado) {
 		if (!run) { clienteConectado = FALSE; continue; }
@@ -615,44 +721,6 @@ DWORD WINAPI threadGereCliente(LPVOID lpParam) {
 
         aux->hPipeCliente = hPipe;
 		aux->g = g;
-
-        if (WaitForSingleObject(g->listaJogadores->g_hMutexJogadores, INFINITE) == WAIT_OBJECT_0) {
-            if (g->listaJogadores->num_jogadores < MAXJOGADORES) {
-                aux->id_jogador = g->listaJogadores->prox_id_jogador;
-                _stprintf_s(aux->nome, _countof(aux->nome), _T("Jogador%d"), aux->id_jogador);
-                aux->pontos = 0;
-
-                // Preencher a struct jogador na lista global
-                g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].id_jogador = aux->id_jogador;
-                _tcscpy_s(g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].nome, NAME_SIZE, aux->nome);
-                g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].pontos = aux->pontos;
-                g->listaJogadores->jogadores[g->listaJogadores->num_jogadores].hPipeCliente = hPipe;
-
-                g->listaJogadores->num_jogadores++;
-                g->listaJogadores->prox_id_jogador++;
-
-                ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
-                escreverOutput(g, _T("Novo cliente conectado: %s (ID: %d, Pipe: %p). Total: %d"), aux->nome, aux->id_jogador, hPipe, g->listaJogadores->num_jogadores);
-            }
-            else {
-                ReleaseMutex(g->listaJogadores->g_hMutexJogadores);
-                escreverOutput(g, _T("Tentativa de conexão rejeitada: servidor cheio. Pipe: %p"), hPipe);
-                enviarMensagemPipe(hPipe, COMANDO_DESLIGAR_CLIENTE);
-                DisconnectNamedPipe(hPipe);
-                CloseHandle(hPipe);
-                free(aux);
-                continue;
-            }
-        }
-        else {
-            LOG_DEBUG(_T("threadGereCliente: Falha ao obter mutex da lista de jogadores. Desconectando cliente no pipe %p."), hPipe);
-            escreverOutput(g, _T("Erro interno ao tentar adicionar novo jogador. Conexão no pipe %p será fechada."), hPipe);
-            enviarMensagemPipe(hPipe, COMANDO_DESLIGAR_CLIENTE);
-            DisconnectNamedPipe(hPipe);
-            CloseHandle(hPipe);
-            free(aux);
-            continue;
-        }
 
 		HANDLE  hThreadCliente = CreateThread(NULL, 0, receberComandos, aux, 0, NULL);
 

@@ -6,6 +6,7 @@
 #include <stdlib.h> 
 #include <time.h> 
 #include <stdbool.h>
+#include <strsafe.h>
 #include "mp.h"
 
 //#define DEBUG_MODE 
@@ -26,6 +27,7 @@
 
 #define LINHA_LETRAS_ALEATORIAS 0 // Linha onde as letras aleatórias serão impressas
 
+#define NAME_SIZE 20
 #define LINHA_INPUT_CLIENTE 2 // Linha onde o input do cliente será lido
 #define PROMPT_INPUT _T("input> ") // Prompt para o input do cliente
 
@@ -48,6 +50,7 @@ typedef struct {
 
     // pipe
     HANDLE hpipe;
+    TCHAR nomeJogador[NAME_SIZE];
 
 	// console
 	HANDLE hStdin;        // Handle para o INPUT da consola
@@ -349,6 +352,58 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     }
 }
 
+BOOL efetuarLoginServidor(globais* g) {
+    if (g == NULL || g->hpipe == INVALID_HANDLE_VALUE || g->hpipe == NULL) {
+        _tprintf(_T("[LOGIN_ERRO] Parâmetros inválidos para efetuarLoginServidor (g ou g->hpipe é NULL/Inválido).\n"));
+        return FALSE;
+    }
+    TCHAR loginCmd[BUFFER_SIZE];
+    TCHAR respostaLogin[BUFFER_SIZE];
+    DWORD bytesLidosLogin;
+
+    HRESULT hr = StringCchPrintf(loginCmd,
+        _countof(loginCmd),
+        _T("/login %s"),
+        g->nomeJogador);
+
+    if (FAILED(hr)) {
+        _tprintf(_T("[LOGIN_ERRO] Falha ao formatar o comando de login (Erro StringCchPrintf: 0x%08X).\n"), hr);
+        return FALSE;
+    }
+
+    LOG_DEBUG(_T("efetuarLoginServidor: Enviando comando de login: '%s' para o pipe %p"), loginCmd, g->hpipe);
+    
+    if (!enviarMensagemPipe(g->hpipe, loginCmd)) {
+        _tprintf(_T("[CLIENTE_ERRO] Falha crítica ao enviar comando de login para o servidor.\n"));
+        return FALSE;
+    }
+
+    ZeroMemory(respostaLogin, sizeof(respostaLogin));
+    LOG_DEBUG(_T("efetuarLoginServidor: Aguardando resposta de login do servidor..."));
+
+    if (ReadFile(g->hpipe,
+        respostaLogin,
+        (sizeof(respostaLogin) / sizeof(TCHAR) - 1) * sizeof(TCHAR), 
+        &bytesLidosLogin,
+        NULL)
+        && bytesLidosLogin > 0)
+    {
+        respostaLogin[bytesLidosLogin / sizeof(TCHAR)] = _T('\0'); 
+        LOG_DEBUG(_T("efetuarLoginServidor: Resposta do login recebida: '%s'"), respostaLogin);
+        
+        if (_tcsicmp(respostaLogin, _T("/login_ok")) == 0) {
+			LOG_DEBUG(_T("efetuarLoginServidor: Login bem-sucedido para o jogador '%s'."), g->nomeJogador);
+            return TRUE;
+        }
+        else {
+            _tprintf(_T("[CLIENTE_ERRO] Login falhou. Motivo do servidor: %s\n"), respostaLogin);
+            return FALSE;
+        }
+    }
+    else 
+        return FALSE;
+}
+
 void offJogador(globais* g) {
 	if (g->dados != NULL) UnmapViewOfFile(g->dados);
 	if (g->mapFile != NULL) CloseHandle(g->mapFile);
@@ -398,6 +453,22 @@ int setup(globais* g) {
         return -2;
     }
     LOG_DEBUG(_T("SETUP: Mutex da consola criado com sucesso.\n"));
+
+    LOG_DEBUG(_T("SETUP: Tentando conectar ao pipe do servidor..."));
+    if (!createPipe(g)) {
+        LOG_DEBUG(_T("SETUP ERRO: Falha ao conectar ao pipe do servidor."));
+        _tprintf(TEXT("[CLIENTE_ERRO] Não foi possível conectar ao servidor.\n"));
+        return ++erros; 
+    }
+    LOG_DEBUG(_T("SETUP: Conectado ao pipe do servidor com sucesso (pipe: %p).\n"), g->hpipe);
+
+	// Efetuar Login no Servidor
+    LOG_DEBUG(_T("SETUP: Tentando efetuar login no servidor como '%s'..."), g->nomeJogador);
+    if (!efetuarLoginServidor(g)) {
+        LOG_DEBUG(_T("SETUP ERRO: Falha no processo de login com o servidor."));
+        return ++erros;
+    }
+    LOG_DEBUG(_T("SETUP: Login no servidor como '%s' bem-sucedido.\n"), g->nomeJogador);
 
     // Configurar Cursor (Esconder)
     LOG_DEBUG(_T("SETUP: Tentando obter mutex da consola para config do cursor...\n"));
@@ -485,12 +556,6 @@ int setup(globais* g) {
             LOG_DEBUG(_T("SETUP: View da MP mapeada.\n"));
     }
 
-    // Conectar ao Pipe do Servidor
-    if (!createPipe(g)) { 
-        LOG_DEBUG(_T("SETUP ERRO: Falha ao conectar ao pipe do servidor.\n"));
-        erros++;
-    }
-
     if (erros > 0)
         LOG_DEBUG(_T("SETUP: Setup concluído com %d erro(s).\n"), erros);
     else
@@ -509,6 +574,14 @@ int _tmain(int argc, LPTSTR argv[]) {
     globais g = { 0 };
 
     LOG_DEBUG(_T("CLIENTE: Chamando setup...\n"));
+	_tprintf(TEXT("Digite o nome do jogador (até %d caracteres): "), NAME_SIZE - 1);
+	fflush(stdout);
+    if (_getts_s(g.nomeJogador, NAME_SIZE) == NULL || _tcslen(g.nomeJogador) == 0) {
+        _tprintf(TEXT("Nome do jogador não pode ser vazio. Encerrando.\n"));
+        return -1;
+	}
+    g.nomeJogador[_tcscspn(g.nomeJogador, _T("\r\n"))] = _T('\0');
+
     if (setup(&g) != 0) {
         _tprintf(TEXT("Falha no setup. Encerrando.\n"));
         offJogador(&g);
